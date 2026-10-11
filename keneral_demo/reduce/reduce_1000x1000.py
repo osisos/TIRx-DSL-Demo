@@ -26,6 +26,12 @@ TARGET = {"kind": "cuda", "arch": "sm_89"}
 BLOCK_CNT = 125
 WARP_PER_CTA = 8
 
+"""
+    首先，每个warp负责一行
+    1个block负责1行，1block8warp
+
+"""
+
 
 # 运气很好，你要求1000x1000的算子，1000 x 2 % 16 = 0，需要输入16对齐
 def SM89_1000x1000_REDUCE_LINE_MAX():
@@ -41,14 +47,20 @@ def SM89_1000x1000_REDUCE_LINE_MAX():
         ),
         OUT: T.Buffer((N,), "float16"),
     ):
-        bx = T.cta_id([BLOCK_CNT])
-        warp_id = T.warp_id([WARP_PER_CTA])
+
+        T.device_entry()
+
+        bx = T.cta_id([BLOCK_CNT])  # 125
+        warp_id = T.warp_id([WARP_PER_CTA])  # 8
         lane_id = T.lane_id([32])
 
         num_buffer = T.alloc_local((4,), "float32")
         num = num_buffer.view("float16")
 
-        #
+        lane_res = T.alloc_local((1,), "float16")
+        lane_res[0] = T.float16(float("-inf"))
+
+        @T.inline
         def load_gmem_to_reg(ptr):
             # float4 向量化加载
             T.ptx.ld(
@@ -63,10 +75,52 @@ def SM89_1000x1000_REDUCE_LINE_MAX():
         rounds = N // 256  # 8 * 32 = warp 每一轮可以处理的元素数
 
         tail_start = N - (N % 256)
+        tail_lane = N % 256
+        tail_thread = tail_lane // 8
 
+        # 计算当前warp负责的行
+        row = bx * 8 + warp_id
+
+        # 主干过程
         for r in range(rounds):
+            col = r * 32 * 8 + lane_id * 8
+            load_gmem_to_reg(X.ptr_to([row, col]))
+            # 真正执行规约
 
+            # 绑定8个元素，手动展开循环
+            for i in T.unroll(4):  # pyright: ignore[reportGeneralTypeIssues]
+                num[i] = T.max(num[i], num[i + 4])
 
+            for i in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
+                num[i] = T.max(num[i], num[i + 2])
 
+            num[0] = T.max(num[0], num[1])
+            lane_res[0] = T.max(num[0], lane_res[0])
+
+        # tail 处理
+        if lane_id < tail_thread:
+            col = tail_start + lane_id * 8
+            load_gmem_to_reg(X.ptr_to([row, col]))
+            for i in T.unroll(4):  # pyright: ignore[reportGeneralTypeIssues]
+                num[i] = T.max(num[i], num[i + 4])
+
+            for i in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
+                num[i] = T.max(num[i], num[i + 2])
+
+            num[0] = T.max(num[0], num[1])
+            lane_res[0] = T.max(lane_res[0], num[0])
+
+        # warp shuffle
+        for stage in T.unroll(5):  # pyright: ignore[reportGeneralTypeIssues]
+            lane_res[0] = T.max(
+                lane_res[0],
+                T.tvm_warp_shuffle_xor(
+                    T.uint32(0xFFFFFFFF), lane_res[0], 16 >> stage, 32, 32
+                ),
+            )
+
+        # write back
+        if lane_id == 0:
+            OUT[row] = lane_res[0]
 
     return kernel
