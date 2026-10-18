@@ -18,8 +18,12 @@ MMA_N = 8
 Q_TILE_M = 16
 K_V_TILE_N = 8
 
-KV_GMEM_SMEM_PIPE_STEP = 3  # 先暂定3，通信掩盖延迟
+KV_GMEM_SMEM_PIPE_STEP = 2  # 先暂定3，通信掩盖延迟
 SMEM_TO_REG_STEP = 2  # smem load to register 的深度
+
+"""
+    核心设计：每个warp负责一个Q_tile的对应的计算
+"""
 
 
 def flash_attention_v1(M: int, N: int, D: int):
@@ -28,6 +32,10 @@ def flash_attention_v1(M: int, N: int, D: int):
     K_TILES = D // MMA_N
     V_TILES = D // MMA_N
     OUT_TILES = D // MMA_N
+
+    Q_REG_PER_THREAD = (D * Q_TILE_M * 2) // (32 * 4)
+    # 每个thread负责的Q寄存器存储个数（总字节数/(总线程数 * 每个寄存器的字节数)
+    Q_REG_CP_TURNS = Q_REG_PER_THREAD // 4  # 一次搬运填满4个32bit寄存器
 
     # Q layout[16, head_dim]，先假设head dim % 16 = 0
     Q_LAYOUT = TileLayout(
@@ -84,11 +92,13 @@ def flash_attention_v1(M: int, N: int, D: int):
         pool.commit()
 
         # 申请Q缓存
-        Q_REG = T.alloc_local((M, D), "float16", layout=Q_LAYOUT)
+        Q_REG = T.alloc_local((M, D), "float16", layout=Q_LAYOUT, align=4)  # 4B对齐
+        Q_LOCAL = Q_REG.local(
+            Q_REG_CP_TURNS, 8, layout=Q_LAYOUT.storage()
+        )  # Global memeory -> register 的拷贝视图
+        Q_CP_VIEW = Q_LOCAL.view("uint32")
 
-        # -- 以上3个使用一份存储，不会复制 --
-
-        # 这里的核心设计是，4个warp共同加载一个 k_tile [8, head_dim] 到 smem（完整的）
+        # 这里的核心设计是，4个warp共同加载一个 k_tile [8, head_dim] 到 smem（完整的），K V 有一个CTA的4个warp的共同负责
         @T.inline
         def load_kv_to_smem(stage, row_offset):
             # 一轮加载的总字节数//一轮总加载数(4 * 32) * 16B
@@ -115,12 +125,21 @@ def flash_attention_v1(M: int, N: int, D: int):
                     16,
                 )
 
-        # 把 Q 的分块直接从gmem加载到reg
+        # Q加载到REG，由于Q是每个warp单独负责计算的，因此Q直接写入每个warp的REG，可以参与的线程只有32个
         @T.inline
-        def load_q_to_req(q_row_offset):
-            # 确定轮数
-            turns = (Q_TILE_M * D * 2) // (
-                4 * 32 * 16
-            )  # 总的数据量/每一轮可以搬运的数据量
+        def load_q_to_req():
+            # Q_tile = [16, 16]
+            for i in range(Q_TILES):
+                # 内层循环，一个循环负责加载4个元素，(16 * 16) / 32 = 4
+                for j in T.unroll(4):  # pyright: ignore[reportGeneralTypeIssues]
+                    row = lane_id // 4 + (j % 2) * 8  # 行数
+                    col = (lane_id % 4) * 2 + (j // 2) * 8 + i * 16
+
+                    Q_CP_VIEW[i, j] = T.ptx.ld(
+                        Q.ptr_to([row, col]),
+                        "uint32",
+                        "b32",
+                        space="global",
+                    )
 
     return kernel
