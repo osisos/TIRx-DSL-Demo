@@ -16,10 +16,11 @@ MMA_K = 16
 MMA_N = 8
 
 Q_TILE_M = 16
-K_V_TILE_N = 8
+K_TILE_N = 8
+V_TILE_N = 8
 
-KV_GMEM_SMEM_PIPE_STEP = 2  # 先暂定3，通信掩盖延迟
-SMEM_TO_REG_STEP = 2  # smem load to register 的深度
+OUTER_STAGE = 2  # 先暂定3，通信掩盖延迟
+INNER_STAGE = 2  # smem load to register 的深度
 
 """
     核心设计：每个warp负责一个Q_tile的对应的计算
@@ -31,32 +32,45 @@ def flash_attention_v1(M: int, N: int, D: int):
     Q_TILES = D // MMA_K
     K_TILES = D // MMA_N
     V_TILES = D // MMA_N
-    OUT_TILES = D // MMA_N
+    RES_TILES = D // MMA_N
 
     Q_REG_PER_THREAD = (D * Q_TILE_M * 2) // (32 * 4)
     # 每个thread负责的Q寄存器存储个数（总字节数/(总线程数 * 每个寄存器的字节数)
     Q_REG_CP_TURNS = Q_REG_PER_THREAD // 4  # 一次搬运填满4个32bit寄存器
 
-    # Q layout[16, head_dim]，先假设head dim % 16 = 0
+    # 以下布局针对 mma.m16n8k16；8 个 lane group、每组 4 lanes 等是固定映射。
+    # Q layout[16, D]，假设 D % MMA_K == 0。
     Q_LAYOUT = TileLayout(
         S[(2, 8, Q_TILES, 2, 4, 2) : (2, 4 @ laneid, 8, 4, 1 @ laneid, 1)],
     )
 
     # Out Layout
-    OUT_LAYOUT = TileLayout(
-        S[(2, 8, OUT_TILES, 4, 2) : (2, 4 @ laneid, 4, 1 @ laneid, 1)],
+    RES_LAYOUT = TileLayout(
+        S[(2, 8, RES_TILES, 4, 2) : (2, 4 @ laneid, 4, 1 @ laneid, 1)],
     )
 
     K_LAYOUT = mma_shared_layout(
         "float16",
         SwizzleMode.SWIZZLE_128B_ATOM,
-        [KV_GMEM_SMEM_PIPE_STEP, K_V_TILE_N, D],
+        [OUTER_STAGE, K_TILE_N, D],
     )
 
     V_LAYOUT = mma_shared_layout(
         "float16",
         SwizzleMode.SWIZZLE_128B_ATOM,
-        [KV_GMEM_SMEM_PIPE_STEP, K_V_TILE_N, D],
+        [OUTER_STAGE, V_TILE_N, D],
+    )
+
+    K_REG_LAYOUT = TileLayout(
+        S[(INNER_STAGE, 8, 2, 4, 2) : (4, 4 @ laneid, 2, 1 @ laneid, 1)]
+    )
+
+    V_REG_LAYOUT = TileLayout(
+        S[(INNER_STAGE, 2, 4, 2, 8) : (4, 2, 1 @ laneid, 1, 4 @ laneid)]
+    )
+
+    QK_REG_LAYOUT = TileLayout(
+        S[(OUTER_STAGE, 2, 8, 4, 2) : (4, 2, 4 @ laneid, 1 @ laneid, 1)]
     )
 
     @T.prim_func
@@ -79,30 +93,58 @@ def flash_attention_v1(M: int, N: int, D: int):
         pool = T.SMEMPool()
 
         KSMEM = pool.alloc(
-            [KV_GMEM_SMEM_PIPE_STEP, K_V_TILE_N, D],
+            [OUTER_STAGE, K_TILE_N, D],
             "float16",
             layout=K_LAYOUT,
         )
         VSEME = pool.alloc(
-            [KV_GMEM_SMEM_PIPE_STEP, K_V_TILE_N, D],
+            [OUTER_STAGE, K_TILE_N, D],
             "float16",
             layout=V_LAYOUT,
         )
 
+        SMEM_READY_BAR = pool.alloc((OUTER_STAGE,), "uint64", align=8)
+        SMEM_FREE_BAR = pool.alloc((OUTER_STAGE,), "uint64", align=8)
+
         pool.commit()
 
-        # 申请Q缓存
-        Q_REG = T.alloc_local((M, D), "float16", layout=Q_LAYOUT, align=4)  # 4B对齐
-        Q_LOCAL = Q_REG.local(
-            Q_REG_CP_TURNS, 8, layout=Q_LAYOUT.storage()
-        )  # Global memeory -> register 的拷贝视图
+        # --- Q寄存器 ---
+        # 4B对齐
+        Q_REG = T.alloc_local((Q_TILE_M, D), "float16", layout=Q_LAYOUT, align=4)
+        # Global memeory -> register 的拷贝视图
+        Q_LOCAL = Q_REG.local(Q_REG_CP_TURNS, 8, layout=Q_LAYOUT.storage())
         Q_CP_VIEW = Q_LOCAL.view("uint32")
+
+        # K 寄存器
+        K_REG = T.alloc_local(
+            (INNER_STAGE, K_TILE_N, 16),
+            "float16",
+            layout=K_LAYOUT,
+        )
+        V_REG = T.alloc_local(
+            (INNER_STAGE, V_TILE_N, 16),
+            "float16",
+            layout=V_LAYOUT,
+        )
+
+        # Q/K 输入为 FP16，QK 使用 FP32 累加，对应 MMA 的 f32.f16.f16.f32。
+        QK_REG = T.alloc_local(
+            (OUTER_STAGE, 16, 8),  # 这个常数，后续可以优化下
+            "float32",
+            layout=QK_REG_LAYOUT,
+        )
+
+        # local 视图
+        QK_LOCAL_VIEW = QK_REG.local()
+        QK_ACC_VIEW = QK_REG.local(
+            OUTER_STAGE, 4, layout=QK_REG_LAYOUT.storage()
+        )  # 每个 lane 每个 stage 持有 4 个 FP32 累加元素。
 
         # 这里的核心设计是，4个warp共同加载一个 k_tile [8, head_dim] 到 smem（完整的），K V 有一个CTA的4个warp的共同负责
         @T.inline
-        def load_kv_to_smem(stage, row_offset):
+        def load_k_to_smem(stage, row_offset):
             # 一轮加载的总字节数//一轮总加载数(4 * 32) * 16B
-            turns = (K_V_TILE_N * D * 2) // (4 * 32 * 16)
+            turns = (K_TILE_N * D * 2) // (4 * 32 * 16)
             # if turns == 0: # 不足一轮 D < 128
 
             row_per_turns = (128 * 16) // (D * 2)
@@ -119,9 +161,19 @@ def flash_attention_v1(M: int, N: int, D: int):
                     16,
                 )
 
+        @T.inline
+        def load_v_to_smem(outer_stage, row_offset):
+            turns = (V_TILE_N * D * 2) // (4 * 32 * 16)
+            row_per_turns = (128 * 16) // (D * 2)
+
+            for i in range(turns):
+                row = i * row_per_turns + ((warp_id * 32 + lane_id) * 16) // (D * 2)
+                col = ((warp_id * 32 + lane_id) * 8) % D
+
+                # 根据地址进行搬运，经过L2缓存
                 T.ptx.cp_async(
-                    VSEME.ptr_to([stage, row, col]),
-                    V.ptr([row_offset + row, col]),
+                    VSEME.ptr_to([outer_stage, row, col]),
+                    K.ptr_to([row_offset + row, col]),
                     16,
                 )
 
@@ -141,5 +193,55 @@ def flash_attention_v1(M: int, N: int, D: int):
                         "b32",
                         space="global",
                     )
+
+        @T.inline
+        def flash_attn(q_tile, k, v, o_tile, q_row_start):
+            # Buffer / view 参数引用已有存储，不在接口处复制数据。
+            # q_tile: float16[Q_TILE_M, D]，完整 Q 块，块内行号从 0 开始。
+            # k、v:   float16[N, D]，完整 K/V 序列的全局内存 Buffer。
+            # o_tile: float16[Q_TILE_M, D]，写入当前 Q 块对应的输出。
+            # 当前接口约定：非 causal，无尾块；N % K_V_TILE_N == 0，D % MMA_K == 0。
+            # 目标：o_tile = softmax(q_tile @ k.T / sqrt(D)) @ v。
+            # TODO: 初始化逐行 max、sum 和 float32 输出累加器。
+            # TODO: 遍历 K/V tiles，执行 QK、online softmax 和 PV 累加。
+            # TODO: 用逐行 sum 归一化累加结果，转换为 float16 写入 o_tile。
+            # 仅定义接口，计算实现待补充。
+            T.evaluate(0)
+
+        @T.inline
+        def CLEAN_QK_REG():
+            for i in range(4 * OUTER_STAGE):
+                QK_LOCAL_VIEW[i] = T.float32(0.0)
+
+        # 内层PIPE LINE
+        @T.inline
+        def CAL_Q_K(outer_stage, k_offset):
+
+            load_k_to_smem(outer_stage, k_offset)
+
+            # TODO: barrier 同步加载完成，等待CTA内的所有warp加载完成
+
+            # 内部实现二级流水线，计算 Q_tile * K_tile 的结果[16, 8]
+
+        @T.inline
+        def MMA_Q_K(out_stage):
+            # QxK的中间规约维度是16
+            K_STPS = D // 16
+            # 实现一个内层流水线，注意，load_smem_to_reg 是可以使用寄存器依赖检查来同步的，不需要手动写同步原语
+
+            # 预填充
+            for s in T.unroll(INNER_STAGE):  # pyright: ignore[reportGeneralTypeIssues]
+                if s < K_STPS:
+                    # TODO: 确认TIRx lowering的结果，是否支持swizzle
+                    T.warp.copy(
+                        K_REG[s, 0:8, 0:K_STPS],
+                        KSMEM[out_stage, 0:8, (s * K_STPS) : (s * K_STPS + K_STPS)],
+                        dispatch="ldstmatrix",
+                    )
+
+            for ki in range(K_STPS):  # 多发射
+                s: T.let = ki % INNER_STAGE
+
+                # 真实执行MMA
 
     return kernel
