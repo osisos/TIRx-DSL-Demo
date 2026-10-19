@@ -109,22 +109,39 @@ def flash_attention_v1(M: int, N: int, D: int):
         pool.commit()
 
         # --- Q寄存器 ---
+        """
+            NOTE: 物理地址、layout、逻辑地址，三个元素构成三个函数，任意确定其中两个，第三个也确定了。
+            这里的Q_LOCAL 有一种错误的写法，Q_LOCAL = Q_REG.local(Q_REG_CP_TURNS, 8, Q_LAYOUT.storage())
+            这里来不及了，后面补一下张量代数。
+            注意，当Layout不是双射的时候，可能引入其他的问题？如何确定Layout不是双射？？？torch编译栈中好像有种技术。
+            但是后面我的Q_LOCAL好像写的有点不爽，我在这里需要的是强连续访问。不知道为什么很容易写错
+
+            感觉隐含了一个代数方程
+            我已知原始的逻辑、和Laytout，那么显然唯一确定了物理；接下来，我需要做一种变换，求出一个laytout，
+            这个laytout，可以让我确定的 逻辑:[Q_TURN, ACC_PER_THREAD]，只需要迭代PER_THREAD 维度，就可以按照某个顺序访问到原始Laytout的中间某个维度的迭代。。。
+
+            此处我在Gemini-notebook 中有个笔记后面慢慢看吧（这里太小，写不开——
+        """
+
         # 4B对齐
         Q_REG = T.alloc_local((Q_TILE_M, D), "float16", layout=Q_LAYOUT, align=4)
         # Global memeory -> register 的拷贝视图
-        Q_LOCAL = Q_REG.local(Q_REG_CP_TURNS, 8, layout=Q_LAYOUT.storage())
+        Q_LOCAL = Q_REG.local(Q_REG_CP_TURNS, 8)  # 直接物理连续视图
         Q_CP_VIEW = Q_LOCAL.view("uint32")
 
         # K 寄存器
         K_REG = T.alloc_local(
             (INNER_STAGE, K_TILE_N, 16),
             "float16",
-            layout=K_LAYOUT,
+            layout=K_REG_LAYOUT,
         )
+
+        K_B32_VIEW = K_REG.view("uint32")
+
         V_REG = T.alloc_local(
             (INNER_STAGE, V_TILE_N, 16),
             "float16",
-            layout=V_LAYOUT,
+            layout=V_REG_LAYOUT,
         )
 
         # Q/K 输入为 FP16，QK 使用 FP32 累加，对应 MMA 的 f32.f16.f16.f32。
@@ -218,10 +235,13 @@ def flash_attention_v1(M: int, N: int, D: int):
         def CAL_Q_K(outer_stage, k_offset):
 
             load_k_to_smem(outer_stage, k_offset)
-
             # TODO: barrier 同步加载完成，等待CTA内的所有warp加载完成
 
             # 内部实现二级流水线，计算 Q_tile * K_tile 的结果[16, 8]
+            # 清理QK Acc
+            CLEAN_QK_REG()
+
+            #
 
         @T.inline
         def MMA_Q_K(out_stage):
@@ -230,18 +250,72 @@ def flash_attention_v1(M: int, N: int, D: int):
             # 实现一个内层流水线，注意，load_smem_to_reg 是可以使用寄存器依赖检查来同步的，不需要手动写同步原语
 
             # 预填充
-            for s in T.unroll(INNER_STAGE):  # pyright: ignore[reportGeneralTypeIssues]
+            # inner stage - 1 法
+            for s in T.unroll(
+                INNER_STAGE - 1
+            ):  # pyright: ignore[reportGeneralTypeIssues]
                 if s < K_STPS:
                     # TODO: 确认TIRx lowering的结果，是否支持swizzle
                     T.warp.copy(
-                        K_REG[s, 0:8, 0:K_STPS],
-                        KSMEM[out_stage, 0:8, (s * K_STPS) : (s * K_STPS + K_STPS)],
+                        K_REG[s, 0:8, 0:MMA_K],
+                        KSMEM[out_stage, 0:8, (s * MMA_K) : ((s + 1) * MMA_K)],
                         dispatch="ldstmatrix",
                     )
 
-            for ki in range(K_STPS):  # 多发射
-                s: T.let = ki % INNER_STAGE
+            # TODO: 看下这里的普通循环写法能不能自动展开
+            for ki in T.unroll(K_STPS):  # pyright: ignore[reportGeneralTypeIssues]
 
-                # 真实执行MMA
+                # 预发起下一段的加载，加载的部分可以轻微错开
+                pre_k: T.let = ki + INNER_STAGE - 1  #
+                pre_s: T.let = pre_k % INNER_STAGE
+
+                if pre_k < K_STPS:
+                    T.warp.copy(
+                        K_REG[pre_s, 0:8, 0:MMA_K],
+                        KSMEM[out_stage, 0:8, (pre_k * MMA_K) : ((pre_k + 1) * MMA_K)],
+                        dispatch="ldstmatrix",
+                    )
+
+                # 发起MMA计算
+
+                s: T.let = ki % INNER_STAGE  # 计算归属的inner pipeline status
+
+                c_ptrs = [
+                    QK_ACC_VIEW.ptr_to([out_stage, i])
+                    for i in T.unroll(4)  # pyright: ignore[reportGeneralTypeIssues]
+                ]
+
+                q_r_offset = lane_id // 4
+                q_c_offset = (lane_id % 4) * 2
+
+                q_ptrs = [
+                    Q_CP_VIEW.ptr_to([ki, i])
+                    for i in T.unroll(4)  # pyright: ignore[reportGeneralTypeIssues]
+                ]
+
+                k_ptrs = [
+                    K_B32_VIEW.ptr_to(
+                        [
+                            s,
+                            q_r_offset,
+                            4 * i + q_c_offset // 2,
+                        ]
+                    )
+                    for i in T.unroll(2)  # pyright: ignore[reportGeneralTypeIssues]
+                ]
+
+                T.ptx.mma(
+                    "m16n8k16",
+                    "row",
+                    "col",
+                    "float32",
+                    "float16",
+                    "float16",
+                    "float32",
+                    c_ptrs,
+                    q_ptrs,
+                    k_ptrs,
+                    c_ptrs,
+                )
 
     return kernel

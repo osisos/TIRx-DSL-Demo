@@ -347,6 +347,7 @@ def SM89_GEMM(M, N, K):
                             )
                             for i in range(acc_per_res_tile)
                         ]
+                        # TODO: 这里需要看下，使用C_REG似乎有更好的写法。
 
                         T.ptx.mma(
                             "m16n8k16",
