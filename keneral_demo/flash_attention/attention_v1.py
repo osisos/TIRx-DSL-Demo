@@ -136,7 +136,8 @@ def flash_attention_v1(M: int, N: int, D: int):
             layout=K_REG_LAYOUT,
         )
 
-        K_B32_VIEW = K_REG.view("uint32")
+        K_LOCAL = K_REG.local(INNER_STAGE, 4)  # 直接物理连续视图
+        K_B32_VIEW = K_LOCAL.view("uint32")
 
         V_REG = T.alloc_local(
             (INNER_STAGE, V_TILE_N, 16),
@@ -280,29 +281,11 @@ def flash_attention_v1(M: int, N: int, D: int):
 
                 s: T.let = ki % INNER_STAGE  # 计算归属的inner pipeline status
 
-                c_ptrs = [
-                    QK_ACC_VIEW.ptr_to([out_stage, i])
-                    for i in T.unroll(4)  # pyright: ignore[reportGeneralTypeIssues]
-                ]
+                c_ptrs = [QK_ACC_VIEW.ptr_to([out_stage, i]) for i in range(4)]
 
-                q_r_offset = lane_id // 4
-                q_c_offset = (lane_id % 4) * 2
+                q_ptrs = [Q_CP_VIEW.ptr_to([ki, i]) for i in range(4)]
 
-                q_ptrs = [
-                    Q_CP_VIEW.ptr_to([ki, i])
-                    for i in T.unroll(4)  # pyright: ignore[reportGeneralTypeIssues]
-                ]
-
-                k_ptrs = [
-                    K_B32_VIEW.ptr_to(
-                        [
-                            s,
-                            q_r_offset,
-                            4 * i + q_c_offset // 2,
-                        ]
-                    )
-                    for i in T.unroll(2)  # pyright: ignore[reportGeneralTypeIssues]
-                ]
+                k_ptrs = [K_B32_VIEW.ptr_to([s, i]) for i in range(2)]
 
                 T.ptx.mma(
                     "m16n8k16",
