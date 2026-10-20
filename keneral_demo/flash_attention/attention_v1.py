@@ -3,7 +3,7 @@ from typing import cast
 import tvm
 from tvm.ir import Var
 from tvm.tirx import script as T
-from tvm.tirx.layout import TileLayout, S, laneid, warpid
+from tvm.tirx.layout import TileLayout, S, R, laneid, warpid
 from tvm.backend.cuda.tile_primitive.tma_utils import mma_shared_layout, SwizzleMode
 from tvm.backend.cuda.lang.tile_scheduler import ClusterPersistentScheduler2D
 from tvm.tirx.script import tile as Tx
@@ -71,6 +71,14 @@ def flash_attention_v1(M: int, N: int, D: int):
 
     QK_REG_LAYOUT = TileLayout(
         S[(OUTER_STAGE, 2, 8, 4, 2) : (4, 2, 4 @ laneid, 1 @ laneid, 1)]
+    )
+
+    ATTN_TILE_ROW_MAX_LAYOUT = TileLayout(
+        S[(OUTER_STAGE, 2, 8) : (2, 1, 4 @ laneid)] + R[4 : 1 @ laneid]
+    )
+
+    ATTN_OLD_ROW_MAX_LAYOUT = TileLayout(
+        S[(2, 8) : (1, 4 @ laneid)] + R[4 : 1 @ laneid]
     )
 
     @T.prim_func
@@ -155,8 +163,17 @@ def flash_attention_v1(M: int, N: int, D: int):
         # local 视图
         QK_LOCAL_VIEW = QK_REG.local()
         QK_ACC_VIEW = QK_REG.local(
-            OUTER_STAGE, 4, layout=QK_REG_LAYOUT.storage()
+            OUTER_STAGE, 4
         )  # 每个 lane 每个 stage 持有 4 个 FP32 累加元素。
+
+        # NOTE: attn row max 规约的中间结果，之所以是这个排布是因为 row:1 的相关的寄存器在[0-3] laneid 中
+        ATTN_TILE_ROW_MAX = T.alloc_local(
+            (OUTER_STAGE, 16, 1), "float32", layout=ATTN_TILE_ROW_MAX_LAYOUT
+        )
+        ATTN_TILE_ROW_MAX_LOCAL = ATTN_TILE_ROW_MAX.local()
+
+        ATTN_ROW_MAX = T.alloc_local((16, 1), "float32", layout=ATTN_OLD_ROW_MAX_LAYOUT)
+        ATTN_ROW_MAX_LOCAL = ATTN_ROW_MAX.local()
 
         # 这里的核心设计是，4个warp共同加载一个 k_tile [8, head_dim] 到 smem（完整的），K V 有一个CTA的4个warp的共同负责
         @T.inline
@@ -228,7 +245,9 @@ def flash_attention_v1(M: int, N: int, D: int):
 
         @T.inline
         def CLEAN_QK_REG():
-            for i in range(4 * OUTER_STAGE):
+            for i in T.unroll(
+                (4 * OUTER_STAGE)
+            ):  # pyright: ignore[reportGeneralTypeIssues]
                 QK_LOCAL_VIEW[i] = T.float32(0.0)
 
         # 内层PIPE LINE
@@ -242,7 +261,23 @@ def flash_attention_v1(M: int, N: int, D: int):
             # 清理QK Acc
             CLEAN_QK_REG()
 
-            #
+            MMA_Q_K(outer_stage)  # 计算出一个Attention的小块
+
+            # Q x K_TILE^T的片段行内规约，online_softmax(Q x K_TILE ^T)
+
+            # attention_tile x v_tile, 结果累加到 res 中
+
+        @T.inline
+        def ATTN_ROW(outer_stage):
+            # QK 连续视图，[0,1,2,3]
+            ATTN_TILE_ROW_MAX_LOCAL[0] = T.max(QK_ACC_VIEW[0], QK_ACC_VIEW[1])
+            ATTN_TILE_ROW_MAX_LOCAL[1] = T.max(QK_ACC_VIEW[2], QK_ACC_VIEW[3])
+
+            # warp_shuffle
+            for h in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
+                idx = outer_stage * 2
+
+            # TODO: 没写完
 
         @T.inline
         def MMA_Q_K(out_stage):
