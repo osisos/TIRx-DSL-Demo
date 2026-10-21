@@ -44,7 +44,11 @@ def flash_attention_v1(M: int, N: int, D: int):
         S[(2, 8, Q_TILES, 2, 4, 2) : (2, 4 @ laneid, 8, 4, 1 @ laneid, 1)],
     )
 
-    # Out Layout
+    # FP32 MMA 输出 [16, D]；普通 stride 的单位是元素，不是字节。
+    # row = 8 * row_half + lane // 4
+    # col = 8 * tile + 2 * (lane % 4) + col_in_pair
+    # 每个 lane 的物理索引 = 4 * tile + 2 * row_half + col_in_pair。
+    # 因此每个 tile 的 c0,c1 属于上半行，c2,c3 属于下半行。
     RES_LAYOUT = TileLayout(
         S[(2, 8, RES_TILES, 4, 2) : (2, 4 @ laneid, 4, 1 @ laneid, 1)],
     )
@@ -78,6 +82,10 @@ def flash_attention_v1(M: int, N: int, D: int):
     )
 
     ATTN_OLD_ROW_MAX_LAYOUT = TileLayout(
+        S[(2, 8) : (1, 4 @ laneid)] + R[4 : 1 @ laneid]
+    )
+
+    ATTN_TILE_MAX_DIFF_LAYOUT = TileLayout(
         S[(2, 8) : (1, 4 @ laneid)] + R[4 : 1 @ laneid]
     )
 
@@ -137,11 +145,21 @@ def flash_attention_v1(M: int, N: int, D: int):
         Q_LOCAL = Q_REG.local(Q_REG_CP_TURNS, 8)  # 直接物理连续视图
         Q_CP_VIEW = Q_LOCAL.view("uint32")
 
+        # RES
+        RES = T.alloc_local((Q_TILE_M, D), "float32", layout=RES_LAYOUT, align=4)
+        # 每个 tile 对应一条 m16n8k16 MMA 的四个 FP32 累加操作数。
+        # 按行缩放时，第 h 行对应 RES_LOCAL[tile, 2*h : 2*h+2]。
+        RES_LOCAL = RES.local(RES_TILES, 4)
+        for tile in T.unroll(RES_TILES):  # pyright: ignore[reportGeneralTypeIssues]
+            for i in T.unroll(4):  # pyright: ignore[reportGeneralTypeIssues]
+                RES_LOCAL[tile, i] = T.float32(0.0)
+
         # K 寄存器
         K_REG = T.alloc_local(
             (INNER_STAGE, K_TILE_N, 16),
             "float16",
             layout=K_REG_LAYOUT,
+            align=4,
         )
 
         K_LOCAL = K_REG.local(INNER_STAGE, 4)  # 直接物理连续视图
@@ -151,6 +169,7 @@ def flash_attention_v1(M: int, N: int, D: int):
             (INNER_STAGE, V_TILE_N, 16),
             "float16",
             layout=V_REG_LAYOUT,
+            align=4,
         )
 
         # Q/K 输入为 FP16，QK 使用 FP32 累加，对应 MMA 的 f32.f16.f16.f32。
@@ -158,6 +177,7 @@ def flash_attention_v1(M: int, N: int, D: int):
             (OUTER_STAGE, 16, 8),  # 这个常数，后续可以优化下
             "float32",
             layout=QK_REG_LAYOUT,
+            align=4,
         )
 
         # local 视图
@@ -168,12 +188,21 @@ def flash_attention_v1(M: int, N: int, D: int):
 
         # NOTE: attn row max 规约的中间结果，之所以是这个排布是因为 row:1 的相关的寄存器在[0-3] laneid 中
         ATTN_TILE_ROW_MAX = T.alloc_local(
-            (OUTER_STAGE, 16, 1), "float32", layout=ATTN_TILE_ROW_MAX_LAYOUT
+            (OUTER_STAGE, 16, 1), "float32", layout=ATTN_TILE_ROW_MAX_LAYOUT, align=4
         )
-        ATTN_TILE_ROW_MAX_LOCAL = ATTN_TILE_ROW_MAX.local()
+        ATTN_TILE_ROW_MAX_LOCAL = ATTN_TILE_ROW_MAX.local(OUTER_STAGE, 2)
 
-        ATTN_ROW_MAX = T.alloc_local((16, 1), "float32", layout=ATTN_OLD_ROW_MAX_LAYOUT)
-        ATTN_ROW_MAX_LOCAL = ATTN_ROW_MAX.local()
+        ATTN_ROW_MAX = T.alloc_local(
+            (16, 1), "float32", layout=ATTN_OLD_ROW_MAX_LAYOUT, align=4
+        )
+        ATTN_ROW_MAX_LOCAL = ATTN_ROW_MAX.local()  # 需要初始化为 负无穷
+        for i in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
+            ATTN_ROW_MAX_LOCAL[i] = T.float32(float("-inf"))
+
+        ATTN_TILE_DIFF = T.alloc_local(
+            (OUTER_STAGE, 16, 1), "float32", layout=ATTN_TILE_MAX_DIFF_LAYOUT, align=4
+        )
+        ATTN_TILE_DIFF_LOCAL = ATTN_TILE_DIFF.local(OUTER_STAGE, 2)
 
         # 这里的核心设计是，4个warp共同加载一个 k_tile [8, head_dim] 到 smem（完整的），K V 有一个CTA的4个warp的共同负责
         @T.inline
@@ -273,11 +302,50 @@ def flash_attention_v1(M: int, N: int, D: int):
             ATTN_TILE_ROW_MAX_LOCAL[0] = T.max(QK_ACC_VIEW[0], QK_ACC_VIEW[1])
             ATTN_TILE_ROW_MAX_LOCAL[1] = T.max(QK_ACC_VIEW[2], QK_ACC_VIEW[3])
 
-            # warp_shuffle
             for h in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
-                idx = outer_stage * 2
+                ATTN_TILE_ROW_MAX_LOCAL[outer_stage, h] = T.max(
+                    QK_ACC_VIEW[outer_stage, h * 2], QK_ACC_VIEW[outer_stage, h * 2 + 1]
+                )
 
-            # TODO: 没写完
+            # 外层迭代，每个线程持有2个元素
+            for st in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
+                # 内层迭代，一个元素的最大值被4个线程持有，warp shuffle
+                for h in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
+                    ATTN_TILE_ROW_MAX_LOCAL[outer_stage, h] = T.max(
+                        ATTN_TILE_ROW_MAX_LOCAL[outer_stage, h],
+                        T.tvm_warp_shuffle_xor(
+                            T.uint32(
+                                0xFFFFFFFF
+                            ),  # mask，本次参与的线程集合，0xFFFFFFFF 是一个32bit，该位 = 1，代表线程参与
+                            ATTN_TILE_ROW_MAX_LOCAL[outer_stage, h],
+                            1 << st,  # lane_mask，
+                            4,  # 4个lane [0,3]
+                            32,  # warp size
+                        ),
+                    )
+
+            # 完成规约之后，更新全局最大值，并且更新？
+            # NOTE：有可能存在乱序问题吗？考虑两次，显然可能导致有一次漏加。
+            # 比较旧的最大值和新的，差值保存在原来的寄存器中。如果没有更新最大值则差值为0
+            for h in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
+                # 更新全局最大值
+                # 全局最大值
+                z = ATTN_TILE_ROW_MAX_LOCAL[outer_stage, h] - ATTN_ROW_MAX_LOCAL[h]
+                ATTN_TILE_DIFF_LOCAL[outer_stage, h] = T.max(T.float32(0.0), z)
+                ATTN_ROW_MAX_LOCAL[h] = T.max(
+                    ATTN_ROW_MAX_LOCAL[h],
+                    ATTN_TILE_ROW_MAX_LOCAL[outer_stage, h],
+                )
+
+            # 接下来真实计算
+
+            # res = exp(attn - new_max) @ V + res * exp(-attn_diff)
+
+            # 计算后半部分, element wise 算子
+            for i in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
+                alpha = T.exp(-ATTN_TILE_DIFF_LOCAL[outer_stage, i])
+
+            #
 
         @T.inline
         def MMA_Q_K(out_stage):
