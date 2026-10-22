@@ -76,13 +76,14 @@ def flash_attention_v1(M: int, N: int, D: int):
         S[(OUTER_STAGE, 2, 8) : (2, 1, 4 @ laneid)] + R[4 : 1 @ laneid]
     )
 
-    ATTN_OLD_ROW_MAX_LAYOUT = TileLayout(
-        S[(2, 8) : (1, 4 @ laneid)] + R[4 : 1 @ laneid]
+    # attention 每一行的最大值
+    ATTN_ROW_MAX_LAYOUT = TileLayout(S[(2, 8) : (1, 4 @ laneid)] + R[4 : 1 @ laneid])
+
+    # attention 当前计算的块和全局最大值的差
+    ATTN_TILE_MAX_DIFF_LAYOUT = TileLayout(
+        S[(OUTER_STAGE, 2, 8) : (2, 1, 4 @ laneid)] + R[4 : 1 @ laneid]
     )
 
-    ATTN_TILE_MAX_DIFF_LAYOUT = TileLayout(
-        S[(2, 8) : (1, 4 @ laneid)] + R[4 : 1 @ laneid]
-    )
 
     @T.prim_func
     def kernel(
@@ -179,6 +180,8 @@ def flash_attention_v1(M: int, N: int, D: int):
         QK_ACC_VIEW = QK_REG.local(
             OUTER_STAGE, 4
         )  # 每个 lane 每个 stage 持有 4 个 FP32 累加元素。
+        QK_FP16_VIEW = QK_ACC_VIEW.view("float16")
+        QK_B32_VIEW = QK_ACC_VIEW("uint32")
 
         # NOTE: attn row max 规约的中间结果，之所以是这个排布是因为 row:1 的相关的寄存器在[0-3] laneid 中
         ATTN_TILE_ROW_MAX = T.alloc_local(
@@ -187,7 +190,7 @@ def flash_attention_v1(M: int, N: int, D: int):
         ATTN_TILE_ROW_MAX_LOCAL = ATTN_TILE_ROW_MAX.local(OUTER_STAGE, 2)
 
         ATTN_ROW_MAX = T.alloc_local(
-            (16, 1), "float32", layout=ATTN_OLD_ROW_MAX_LAYOUT, align=4
+            (16, 1), "float32", layout=ATTN_ROW_MAX_LAYOUT, align=4
         )
         ATTN_ROW_MAX_LOCAL = ATTN_ROW_MAX.local()  # 需要初始化为 负无穷
         for i in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
@@ -197,6 +200,8 @@ def flash_attention_v1(M: int, N: int, D: int):
             (OUTER_STAGE, 16, 1), "float32", layout=ATTN_TILE_MAX_DIFF_LAYOUT, align=4
         )
         ATTN_TILE_DIFF_LOCAL = ATTN_TILE_DIFF.local(OUTER_STAGE, 2)
+
+        ATTN_ROW_SUM =
 
         # 这里的核心设计是，4个warp共同加载一个 k_tile [8, head_dim] 到 smem（完整的），K V 有一个CTA的4个warp的共同负责
         @T.inline
@@ -296,9 +301,6 @@ def flash_attention_v1(M: int, N: int, D: int):
             # [0, 1] <-> [[0,0], [0,1]]
             # [2, 3] <-> [[8,0], [8,1]]
 
-            ATTN_TILE_ROW_MAX_LOCAL[outer_stage, 0] = T.max(QK_ACC_VIEW[0], QK_ACC_VIEW[1])
-            ATTN_TILE_ROW_MAX_LOCAL[outer_stage, 1] = T.max(QK_ACC_VIEW[2], QK_ACC_VIEW[3])
-
             for h in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
                 ATTN_TILE_ROW_MAX_LOCAL[outer_stage, h] = T.max(
                     QK_ACC_VIEW[outer_stage, h * 2], QK_ACC_VIEW[outer_stage, h * 2 + 1]
@@ -336,13 +338,32 @@ def flash_attention_v1(M: int, N: int, D: int):
 
             # 接下来真实计算
 
-            # res = exp(attn - new_max) @ V + res * exp(-attn_diff)
+            # res = exp(QK - Attn_max) @ V + res * exp(-attn_diff)
 
-            # 计算后半部分, element wise 算子
+            # 计算 res *= exp(-attn)，暂存在 RES_LOCAL
             for r in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
-                alpha = T.exp(-ATTN_TILE_DIFF_LOCAL[outer_stage, r])  #
-                # res * exp(-attn_diff)
-                for
+                alpha = T.exp(-ATTN_TILE_DIFF_LOCAL[outer_stage, r])
+                for i in T.unroll(
+                    RES_TILES
+                ):  # pyright: ignore[reportGeneralTypeIssues]
+                    RES_LOCAL[i, r * 2] *= alpha
+                    RES_LOCAL[i, r * 2 + 1] *= alpha
+
+            # 更新当前attention, atteniton = attention - attn_row_max
+            for i in T.unroll(4):  # pyright: ignore[reportGeneralTypeIssues]
+                QK_ACC_VIEW[outer_stage, i] = T.exp(
+                    QK_ACC_VIEW[outer_stage, i] - ATTN_ROW_MAX_LOCAL[i // 2]
+                )
+
+            # 计算 Attn_tile x V
+
+        @T.inline
+        def MMA_ATTN_V(out_stage):
+            # 计算ATTN x V，规约的中间维度 = 8
+            # RES = RES + ATTN x V，其中, ATTN = fp32, V = fp16
+            # 使用标准的寄存器内移位的方式，我们使用寄存器原位操作的方式，不分配额外的内存
+            T.evaluate(1)
+            # NOTE: 明天从这里继续，动态寻址有可能让 寄存器 到 local memory，很危险。
 
         @T.inline
         def MMA_Q_K(out_stage):
@@ -363,9 +384,7 @@ def flash_attention_v1(M: int, N: int, D: int):
                         dispatch="ldstmatrix",
                     )
 
-            # TODO: 看下这里的普通循环写法能不能自动展开
             for ki in T.unroll(K_STPS):  # pyright: ignore[reportGeneralTypeIssues]
-
                 # 预发起下一段的加载，加载的部分可以轻微错开
                 pre_k: T.let = ki + INNER_STAGE - 1  #
                 pre_s: T.let = pre_k % INNER_STAGE
@@ -382,9 +401,7 @@ def flash_attention_v1(M: int, N: int, D: int):
                 s: T.let = ki % INNER_STAGE  # 计算归属的inner pipeline status
 
                 c_ptrs = [QK_ACC_VIEW.ptr_to([out_stage, i]) for i in range(4)]
-
                 q_ptrs = [Q_CP_VIEW.ptr_to([ki, i]) for i in range(4)]
-
                 k_ptrs = [K_B32_VIEW.ptr_to([s, i]) for i in range(2)]
 
                 T.ptx.mma(
