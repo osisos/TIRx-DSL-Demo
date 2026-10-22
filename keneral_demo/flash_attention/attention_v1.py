@@ -44,11 +44,6 @@ def flash_attention_v1(M: int, N: int, D: int):
         S[(2, 8, Q_TILES, 2, 4, 2) : (2, 4 @ laneid, 8, 4, 1 @ laneid, 1)],
     )
 
-    # FP32 MMA 输出 [16, D]；普通 stride 的单位是元素，不是字节。
-    # row = 8 * row_half + lane // 4
-    # col = 8 * tile + 2 * (lane % 4) + col_in_pair
-    # 每个 lane 的物理索引 = 4 * tile + 2 * row_half + col_in_pair。
-    # 因此每个 tile 的 c0,c1 属于上半行，c2,c3 属于下半行。
     RES_LAYOUT = TileLayout(
         S[(2, 8, RES_TILES, 4, 2) : (2, 4 @ laneid, 4, 1 @ laneid, 1)],
     )
@@ -179,7 +174,6 @@ def flash_attention_v1(M: int, N: int, D: int):
             layout=QK_REG_LAYOUT,
             align=4,
         )
-
         # local 视图
         QK_LOCAL_VIEW = QK_REG.local()
         QK_ACC_VIEW = QK_REG.local(
@@ -298,9 +292,12 @@ def flash_attention_v1(M: int, N: int, D: int):
 
         @T.inline
         def ATTN_ROW(outer_stage):
-            # QK 连续视图，[0,1,2,3]
-            ATTN_TILE_ROW_MAX_LOCAL[0] = T.max(QK_ACC_VIEW[0], QK_ACC_VIEW[1])
-            ATTN_TILE_ROW_MAX_LOCAL[1] = T.max(QK_ACC_VIEW[2], QK_ACC_VIEW[3])
+            # QK 连续视图
+            # [0, 1] <-> [[0,0], [0,1]]
+            # [2, 3] <-> [[8,0], [8,1]]
+
+            ATTN_TILE_ROW_MAX_LOCAL[outer_stage, 0] = T.max(QK_ACC_VIEW[0], QK_ACC_VIEW[1])
+            ATTN_TILE_ROW_MAX_LOCAL[outer_stage, 1] = T.max(QK_ACC_VIEW[2], QK_ACC_VIEW[3])
 
             for h in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
                 ATTN_TILE_ROW_MAX_LOCAL[outer_stage, h] = T.max(
@@ -342,10 +339,10 @@ def flash_attention_v1(M: int, N: int, D: int):
             # res = exp(attn - new_max) @ V + res * exp(-attn_diff)
 
             # 计算后半部分, element wise 算子
-            for i in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
-                alpha = T.exp(-ATTN_TILE_DIFF_LOCAL[outer_stage, i])
-
-            #
+            for r in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
+                alpha = T.exp(-ATTN_TILE_DIFF_LOCAL[outer_stage, r])  #
+                # res * exp(-attn_diff)
+                for
 
         @T.inline
         def MMA_Q_K(out_stage):
