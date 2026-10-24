@@ -44,6 +44,7 @@ def flash_attention_v1(M: int, N: int, D: int):
         S[(2, 8, Q_TILES, 2, 4, 2) : (2, 4 @ laneid, 8, 4, 1 @ laneid, 1)],
     )
 
+    # RES 的计算似乎有点问题，RES_TILES = D // 8, 实际上
     RES_LAYOUT = TileLayout(
         S[(2, 8, RES_TILES, 4, 2) : (2, 4 @ laneid, 4, 1 @ laneid, 1)],
     )
@@ -64,8 +65,11 @@ def flash_attention_v1(M: int, N: int, D: int):
         S[(INNER_STAGE, 8, 2, 4, 2) : (4, 4 @ laneid, 2, 1 @ laneid, 1)]
     )
 
+    # PV 的 m16n8k8 B fragment: V[stage, row, col]。
+    # row = 2 * (laneid % 4) + i, col = laneid // 4, i in {0, 1}。
+    # 每个 lane、每个 stage 保存两个 FP16，打包成一个 b32。
     V_REG_LAYOUT = TileLayout(
-        S[(INNER_STAGE, 2, 4, 2, 8) : (4, 2, 1 @ laneid, 1, 4 @ laneid)]
+        S[(INNER_STAGE, 4, 2, 8) : (2, 1 @ laneid, 1, 4 @ laneid)]
     )
 
     QK_REG_LAYOUT = TileLayout(
@@ -115,7 +119,7 @@ def flash_attention_v1(M: int, N: int, D: int):
             "float16",
             layout=K_LAYOUT,
         )
-        VSEME = pool.alloc(
+        VSMEM = pool.alloc(
             [OUTER_STAGE, K_TILE_N, D],
             "float16",
             layout=V_LAYOUT,
@@ -172,11 +176,13 @@ def flash_attention_v1(M: int, N: int, D: int):
         K_B32_VIEW = K_LOCAL.view("uint32")
 
         V_REG = T.alloc_local(
-            (INNER_STAGE, V_TILE_N, 16),
+            (INNER_STAGE, V_TILE_N, MMA_N),
             "float16",
             layout=V_REG_LAYOUT,
             align=4,
         )
+        V_REG_LOCAL = V_REG.local(INNER_STAGE, 2)
+        V_REG_B32_VIEW = V_REG_LOCAL.view("uint32")
 
         # Q/K 输入为 FP16，QK 使用 FP32 累加，对应 MMA 的 f32.f16.f16.f32。
         # NOTE: [Local Memory 风险 - 动态 Stage 索引与跨位宽指针重解释]
@@ -196,8 +202,6 @@ def flash_attention_v1(M: int, N: int, D: int):
         QK_ACC_VIEW = QK_REG.local(
             OUTER_STAGE, 4
         )  # 每个 lane 每个 stage 持有 4 个 FP32 累加元素。
-        QK_FP16_VIEW = QK_ACC_VIEW.view("float16")
-        QK_B32_VIEW = QK_ACC_VIEW.view("uint32")
 
         # NOTE: attn row max 规约的中间结果，之所以是这个排布是因为 row:1 的相关的寄存器在[0-3] laneid 中
         # NOTE: [Local Memory 风险] 同 QK_REG，若以运行时变量 outer_stage 索引该局部缓冲，会退化到 Local Memory。
@@ -228,6 +232,7 @@ def flash_attention_v1(M: int, N: int, D: int):
             (OUTER_STAGE, 16, 8), "float16", layout=ATTN_TILE_LAYOUT, align=4
         )
         ATTN_TILE_LOCAL = ATTN_TILE.local((OUTER_STAGE, 4))
+        ATTN_REG_B32_VIEW = ATTN_TILE_LOCAL.view("uint32")
 
         # 这里的核心设计是，4个warp共同加载一个 k_tile [8, head_dim] 到 smem（完整的），K V 有一个CTA的4个warp的共同负责
         @T.inline
@@ -261,7 +266,7 @@ def flash_attention_v1(M: int, N: int, D: int):
 
                 # 根据地址进行搬运，经过L2缓存
                 T.ptx.cp_async(
-                    VSEME.ptr_to([outer_stage, row, col]),
+                    VSMEM.ptr_to([outer_stage, row, col]),
                     K.ptr_to([row_offset + row, col]),
                     16,
                 )
@@ -415,12 +420,59 @@ def flash_attention_v1(M: int, N: int, D: int):
             # 计算 Attn_tile x V
             # 本次使用复制出一段新的寄存器
 
-            K_STPS = D // 16  # NOTE: 这一行能挪到外面展开吗?
+            N_STPS = D // MMA_N  # 沿输出列分块，PV 的规约维度固定为 8。
+
+            # 本函数计算过程和QxK^T计算相同
+
+            # 二级流水线，预填充
+            for s in T.unroll(
+                INNER_STAGE - 1
+            ):  # pyright: ignore[reportGeneralTypeIssues]
+                if s < N_STPS:
+                    T.warp.copy(
+                        V_REG[s, 0:8, 0:MMA_N],
+                        VSMEM[out_stage, 0:8, (s * MMA_N) : ((s + 1) * MMA_N)],
+                        dispatch="ldstmatrix",
+                    )
+
+            # 执行流水线
+            for n in T.unroll(N_STPS):  # pyright: ignore[reportGeneralTypeIssues]
+                pre_n: T.let = n + INNER_STAGE - 1
+                pre_s: T.let = pre_n % INNER_STAGE
+
+                if pre_n < N_STPS:
+                    T.warp.copy(
+                        V_REG[pre_s, 0:8, 0:MMA_N],
+                        VSMEM[out_stage, 0:8, (pre_n * MMA_N) : ((pre_n + 1) * MMA_N)],
+                        dispatch="ldstmatrix",
+                    )
+
+                s: T.let = n % INNER_STAGE
+
+                attn_ptrs = [ATTN_REG_B32_VIEW.ptr_to([out_stage, i]) for i in range(2)]
+                # 当前流水线槽内的一个 b32，保存 V 的两个 FP16 元素。
+                v_ptrs = [V_REG_B32_VIEW.ptr_to([s, 0])]
+
+                res_ptrs = [RES_LOCAL.ptr_to([s, 0])]
+
+                T.ptx.mma(
+                    "m16n8k8",
+                    "row",
+                    "col",
+                    "float32",
+                    "float16",
+                    "float16",
+                    "float32",
+                    res_ptrs,
+                    attn_ptrs,
+                    v_ptrs,
+                    res_ptrs,
+                )
 
         @T.inline
         def MMA_Q_K(out_stage):
             # QxK的中间规约维度是16
-            MMA_K_STPS = D // 16
+            K_STPS = D // 16
             # 实现一个内层流水线，注意，load_smem_to_reg 是可以使用寄存器依赖检查来同步的，不需要手动写同步原语
 
             # 预填充
@@ -428,7 +480,7 @@ def flash_attention_v1(M: int, N: int, D: int):
             for s in T.unroll(
                 INNER_STAGE - 1
             ):  # pyright: ignore[reportGeneralTypeIssues]
-                if s < MMA_K_STPS:
+                if s < K_STPS:
                     # TODO: 确认TIRx lowering的结果，是否支持swizzle
                     T.warp.copy(
                         K_REG[s, 0:8, 0:MMA_K],
@@ -436,16 +488,18 @@ def flash_attention_v1(M: int, N: int, D: int):
                         dispatch="ldstmatrix",
                     )
 
-            for ki in T.unroll(MMA_K_STPS):  # pyright: ignore[reportGeneralTypeIssues]
+            for ki in T.unroll(K_STPS):  # pyright: ignore[reportGeneralTypeIssues]
                 # 预发起下一段的加载，加载的部分可以轻微错开
+
                 # NOTE: [Local Memory 风险 - T.let 绑定运行时 Var]
                 # T.let 会生成 TIR LetStmt 运行时变量（而非编译期常量）。
                 # 若 T.warp.copy 或 ptr_to 在 Lowering 时未先将 pre_s / s 常量折叠，
                 # K_REG[pre_s, ...] 和 K_B32_VIEW.ptr_to([s, i]) 会被视为动态索引，导致 K_REG 退化到 Local Memory。
-                pre_k: T.let = ki + INNER_STAGE - 1  #
+
+                pre_k: T.let = ki + INNER_STAGE - 1
                 pre_s: T.let = pre_k % INNER_STAGE
 
-                if pre_k < MMA_K_STPS:
+                if pre_k < K_STPS:
                     T.warp.copy(
                         K_REG[pre_s, 0:8, 0:MMA_K],
                         KSMEM[out_stage, 0:8, (pre_k * MMA_K) : ((pre_k + 1) * MMA_K)],
@@ -459,9 +513,11 @@ def flash_attention_v1(M: int, N: int, D: int):
                 # NOTE: [Local Memory 风险 - ptr_to 取动态偏移指针]
                 # T.ptx.mma 要求操作数绑定到静态寄存器。若 out_stage、ki、s 中有任何一个在生成 C 代码时
                 # 不是编译期常量，对局部数组取地址 &arr[var]（Pointer Escape）会直接迫使对应数组落入 Local Memory。
+
                 c_ptrs = [QK_ACC_VIEW.ptr_to([out_stage, i]) for i in range(4)]
                 q_ptrs = [Q_CP_VIEW.ptr_to([ki, i]) for i in range(4)]
                 k_ptrs = [K_B32_VIEW.ptr_to([s, i]) for i in range(2)]
+                # NOTE: [in_stage, 4] f16, [in_stage, 2] f32
 
                 T.ptx.mma(
                     "m16n8k16",
