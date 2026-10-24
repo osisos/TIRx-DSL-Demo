@@ -84,6 +84,12 @@ def flash_attention_v1(M: int, N: int, D: int):
         S[(OUTER_STAGE, 2, 8) : (2, 1, 4 @ laneid)] + R[4 : 1 @ laneid]
     )
 
+    ATTN_ROW_SUM_LAYOUT = TileLayout(S[(2, 8) : (1, 4 @ laneid)] + R[4 : 1 @ laneid])
+
+    # Attention tile，Q x K^T online softmax 的结果写入
+    ATTN_TILE_LAYOUT = TileLayout(
+        S[(OUTER_STAGE, 2, 8, 4, 2) : (4, 2, 4 @ laneid, 1 @ laneid, 1)]
+    )
 
     @T.prim_func
     def kernel(
@@ -136,6 +142,10 @@ def flash_attention_v1(M: int, N: int, D: int):
         """
 
         # 4B对齐
+        # NOTE: [Local Memory 风险 - 寄存器容量溢出 (Register Spill)]
+        # Q_REG 占 D/4 个 32-bit 寄存器/线程，RES 占 D/2 个寄存器/线程（合计 3D/4）。
+        # 当 D >= 256 时，仅 Q_REG + RES 就占 192 个寄存器，加上 K/V/QK 缓冲与展开后的临时变量，
+        # 极易超过 SM89 单线程 255 寄存器上限，触发 ptxas 被动 Spill 到 Local Memory。
         Q_REG = T.alloc_local((Q_TILE_M, D), "float16", layout=Q_LAYOUT, align=4)
         # Global memeory -> register 的拷贝视图
         Q_LOCAL = Q_REG.local(Q_REG_CP_TURNS, 8)  # 直接物理连续视图
@@ -169,6 +179,12 @@ def flash_attention_v1(M: int, N: int, D: int):
         )
 
         # Q/K 输入为 FP16，QK 使用 FP32 累加，对应 MMA 的 f32.f16.f16.f32。
+        # NOTE: [Local Memory 风险 - 动态 Stage 索引与跨位宽指针重解释]
+        # 1. QK_REG / ATTN_TILE_ROW_MAX / ATTN_TILE_DIFF 包含了 OUTER_STAGE 维度。
+        #    若外层 K/V 循环未按 OUTER_STAGE 展开，传入运行时的 outer_stage 变量作下标，
+        #    会导致动态寻址并强制退化到 Local Memory（实际上寄存器层无需 OUTER_STAGE 维度）。
+        # 2. 对同一个 float32 数组同时创建 float16 / uint32 视图并做原位半宽覆写（In-place Type Punning），
+        #    容易破坏 NVCC 的 SROA（标量替换）别名分析，导致整个数组落入 Local Memory。
         QK_REG = T.alloc_local(
             (OUTER_STAGE, 16, 8),  # 这个常数，后续可以优化下
             "float32",
@@ -181,9 +197,10 @@ def flash_attention_v1(M: int, N: int, D: int):
             OUTER_STAGE, 4
         )  # 每个 lane 每个 stage 持有 4 个 FP32 累加元素。
         QK_FP16_VIEW = QK_ACC_VIEW.view("float16")
-        QK_B32_VIEW = QK_ACC_VIEW("uint32")
+        QK_B32_VIEW = QK_ACC_VIEW.view("uint32")
 
         # NOTE: attn row max 规约的中间结果，之所以是这个排布是因为 row:1 的相关的寄存器在[0-3] laneid 中
+        # NOTE: [Local Memory 风险] 同 QK_REG，若以运行时变量 outer_stage 索引该局部缓冲，会退化到 Local Memory。
         ATTN_TILE_ROW_MAX = T.alloc_local(
             (OUTER_STAGE, 16, 1), "float32", layout=ATTN_TILE_ROW_MAX_LAYOUT, align=4
         )
@@ -196,12 +213,21 @@ def flash_attention_v1(M: int, N: int, D: int):
         for i in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
             ATTN_ROW_MAX_LOCAL[i] = T.float32(float("-inf"))
 
+        # NOTE: [Local Memory 风险] 同 QK_REG，若以运行时变量 outer_stage 索引该局部缓冲，会退化到 Local Memory。
         ATTN_TILE_DIFF = T.alloc_local(
             (OUTER_STAGE, 16, 1), "float32", layout=ATTN_TILE_MAX_DIFF_LAYOUT, align=4
         )
         ATTN_TILE_DIFF_LOCAL = ATTN_TILE_DIFF.local(OUTER_STAGE, 2)
 
-        ATTN_ROW_SUM =
+        ATTN_ROW_SUM = T.alloc_local(
+            (16, 1), "float32", layout=ATTN_ROW_SUM_LAYOUT, align=4
+        )
+        ATTN_ROW_SUM_LOCAL = ATTN_ROW_SUM.local()
+
+        ATTN_TILE = T.alloc_local(
+            (OUTER_STAGE, 16, 8), "float16", layout=ATTN_TILE_LAYOUT, align=4
+        )
+        ATTN_TILE_LOCAL = ATTN_TILE.local((OUTER_STAGE, 4))
 
         # 这里的核心设计是，4个warp共同加载一个 k_tile [8, head_dim] 到 smem（完整的），K V 有一个CTA的4个warp的共同负责
         @T.inline
@@ -244,6 +270,12 @@ def flash_attention_v1(M: int, N: int, D: int):
         @T.inline
         def load_q_to_req():
             # Q_tile = [16, 16]
+
+            # NOTE: [Local Memory 风险 - 循环未展开导致动态索引]
+            # 此处使用普通 range(Q_TILES) 而非 T.unroll(Q_TILES)，循环变量 i 在 TIR 中是运行时变量。
+            # 下方 Q_CP_VIEW[i, j] 使用 i 索引寄存器视图，若后端未自动完全展开该循环，
+            # 会导致整个 Q_REG 因运行时动态寻址而被分配到 Local Memory！应改为 T.unroll(Q_TILES)。
+
             for i in range(Q_TILES):
                 # 内层循环，一个循环负责加载4个元素，(16 * 16) / 32 = 4
                 for j in T.unroll(4):  # pyright: ignore[reportGeneralTypeIssues]
@@ -300,6 +332,10 @@ def flash_attention_v1(M: int, N: int, D: int):
             # QK 连续视图
             # [0, 1] <-> [[0,0], [0,1]]
             # [2, 3] <-> [[8,0], [8,1]]
+            # NOTE: [Local Memory 风险 - 运行时 outer_stage 索引局部数组]
+            # 本函数中所有 [outer_stage, ...] 下标访问（ATTN_TILE_ROW_MAX_LOCAL、QK_ACC_VIEW、ATTN_TILE_DIFF_LOCAL），
+            # 如果调用方传入的 outer_stage 是运行时变量（例如 ko % OUTER_STAGE），
+            # 这三个 T.alloc_local 缓冲区都会因非常量索引退化到 Local Memory。
 
             for h in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
                 ATTN_TILE_ROW_MAX_LOCAL[outer_stage, h] = T.max(
@@ -310,6 +346,7 @@ def flash_attention_v1(M: int, N: int, D: int):
             for st in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
                 # 内层迭代，一个元素的最大值被4个线程持有，warp shuffle
                 for h in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
+                    # 规约，计算每一行的最大值
                     ATTN_TILE_ROW_MAX_LOCAL[outer_stage, h] = T.max(
                         ATTN_TILE_ROW_MAX_LOCAL[outer_stage, h],
                         T.tvm_warp_shuffle_xor(
@@ -322,6 +359,8 @@ def flash_attention_v1(M: int, N: int, D: int):
                             32,  # warp size
                         ),
                     )
+
+                    # 规约，计算一行到的sum
 
             # 完成规约之后，更新全局最大值，并且更新？
             # NOTE：有可能存在乱序问题吗？考虑两次，显然可能导致有一次漏加。
@@ -355,7 +394,9 @@ def flash_attention_v1(M: int, N: int, D: int):
                     QK_ACC_VIEW[outer_stage, i] - ATTN_ROW_MAX_LOCAL[i // 2]
                 )
 
-            # 计算 Attn_tile x V
+            # 计算 Attn_tile x V，需要预先准备 Attn tile, fp16
+            for i in T.unroll(4):  # pyright: ignore[reportGeneralTypeIssues]
+                ATTN_TILE_LOCAL[outer_stage, i] = QK_ACC_VIEW[outer_stage, i]
 
         @T.inline
         def MMA_ATTN_V(out_stage):
@@ -363,12 +404,23 @@ def flash_attention_v1(M: int, N: int, D: int):
             # RES = RES + ATTN x V，其中, ATTN = fp32, V = fp16
             # 使用标准的寄存器内移位的方式，我们使用寄存器原位操作的方式，不分配额外的内存
             T.evaluate(1)
+
             # NOTE: 明天从这里继续，动态寻址有可能让 寄存器 到 local memory，很危险。
+            # NOTE: [Local Memory 风险 - 原位类型转换与寄存器移位]
+            # 1. 不要在 QK_REG (float32) 上通过 QK_FP16_VIEW 原位写入半精度并强转指针传给 mma，
+            #    跨位宽的原位指针别名会阻碍编译器 SROA 标量化，导致 QK_REG 落入 Local Memory。
+            #    正确做法：单独 T.alloc_local((4,), "float16") 存放 P_frag，编译器会通过生命周期分析自动复用物理寄存器。
+            # 2. 切勿使用非 T.unroll 的循环对寄存器数组做移位/重排，任何非常量下标或手动行列转置循环都会退化到 Local Memory。
+
+            # 计算 Attn_tile x V
+            # 本次使用复制出一段新的寄存器
+
+            K_STPS = D // 16  # NOTE: 这一行能挪到外面展开吗?
 
         @T.inline
         def MMA_Q_K(out_stage):
             # QxK的中间规约维度是16
-            K_STPS = D // 16
+            MMA_K_STPS = D // 16
             # 实现一个内层流水线，注意，load_smem_to_reg 是可以使用寄存器依赖检查来同步的，不需要手动写同步原语
 
             # 预填充
@@ -376,7 +428,7 @@ def flash_attention_v1(M: int, N: int, D: int):
             for s in T.unroll(
                 INNER_STAGE - 1
             ):  # pyright: ignore[reportGeneralTypeIssues]
-                if s < K_STPS:
+                if s < MMA_K_STPS:
                     # TODO: 确认TIRx lowering的结果，是否支持swizzle
                     T.warp.copy(
                         K_REG[s, 0:8, 0:MMA_K],
@@ -384,12 +436,16 @@ def flash_attention_v1(M: int, N: int, D: int):
                         dispatch="ldstmatrix",
                     )
 
-            for ki in T.unroll(K_STPS):  # pyright: ignore[reportGeneralTypeIssues]
+            for ki in T.unroll(MMA_K_STPS):  # pyright: ignore[reportGeneralTypeIssues]
                 # 预发起下一段的加载，加载的部分可以轻微错开
+                # NOTE: [Local Memory 风险 - T.let 绑定运行时 Var]
+                # T.let 会生成 TIR LetStmt 运行时变量（而非编译期常量）。
+                # 若 T.warp.copy 或 ptr_to 在 Lowering 时未先将 pre_s / s 常量折叠，
+                # K_REG[pre_s, ...] 和 K_B32_VIEW.ptr_to([s, i]) 会被视为动态索引，导致 K_REG 退化到 Local Memory。
                 pre_k: T.let = ki + INNER_STAGE - 1  #
                 pre_s: T.let = pre_k % INNER_STAGE
 
-                if pre_k < K_STPS:
+                if pre_k < MMA_K_STPS:
                     T.warp.copy(
                         K_REG[pre_s, 0:8, 0:MMA_K],
                         KSMEM[out_stage, 0:8, (pre_k * MMA_K) : ((pre_k + 1) * MMA_K)],
@@ -400,6 +456,9 @@ def flash_attention_v1(M: int, N: int, D: int):
 
                 s: T.let = ki % INNER_STAGE  # 计算归属的inner pipeline status
 
+                # NOTE: [Local Memory 风险 - ptr_to 取动态偏移指针]
+                # T.ptx.mma 要求操作数绑定到静态寄存器。若 out_stage、ki、s 中有任何一个在生成 C 代码时
+                # 不是编译期常量，对局部数组取地址 &arr[var]（Pointer Escape）会直接迫使对应数组落入 Local Memory。
                 c_ptrs = [QK_ACC_VIEW.ptr_to([out_stage, i]) for i in range(4)]
                 q_ptrs = [Q_CP_VIEW.ptr_to([ki, i]) for i in range(4)]
                 k_ptrs = [K_B32_VIEW.ptr_to([s, i]) for i in range(2)]
