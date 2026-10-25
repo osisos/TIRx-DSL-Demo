@@ -29,6 +29,7 @@ INNER_STAGE = 2  # smem load to register 的深度
 
 def flash_attention_v1(M: int, N: int, D: int):
 
+    SOFTMAX_SCALE = D ** -0.5
     Q_TILES = D // MMA_K
     K_TILES = D // MMA_N
     V_TILES = D // MMA_N
@@ -343,6 +344,10 @@ def flash_attention_v1(M: int, N: int, D: int):
             # 本函数中所有 [outer_stage, ...] 下标访问（ATTN_TILE_ROW_MAX_LOCAL、QK_ACC_VIEW、ATTN_TILE_DIFF_LOCAL），
             # 如果调用方传入的 outer_stage 是运行时变量（例如 ko % OUTER_STAGE），
             # 这三个 T.alloc_local 缓冲区都会因非常量索引退化到 Local Memory。
+
+            # softmax 的输入为 QK / sqrt(D)，先缩放再计算逐行 max、exp 和 sum。
+            for i in T.unroll(4):  # pyright: ignore[reportGeneralTypeIssues]
+                QK_ACC_VIEW[outer_stage, i] *= T.float32(SOFTMAX_SCALE)
 
             # 计算 attention 的最大值
             for h in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
