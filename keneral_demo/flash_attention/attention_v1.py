@@ -227,6 +227,8 @@ def flash_attention_v1(M: int, N: int, D: int):
             (16, 1), "float32", layout=ATTN_ROW_SUM_LAYOUT, align=4
         )
         ATTN_ROW_SUM_LOCAL = ATTN_ROW_SUM.local()
+        for i in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
+            ATTN_ROW_SUM_LOCAL[i] = T.float32(0.0)
 
         ATTN_TILE = T.alloc_local(
             (OUTER_STAGE, 16, 8), "float16", layout=ATTN_TILE_LAYOUT, align=4
@@ -342,6 +344,7 @@ def flash_attention_v1(M: int, N: int, D: int):
             # 如果调用方传入的 outer_stage 是运行时变量（例如 ko % OUTER_STAGE），
             # 这三个 T.alloc_local 缓冲区都会因非常量索引退化到 Local Memory。
 
+            # 计算 attention 的最大值
             for h in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
                 ATTN_TILE_ROW_MAX_LOCAL[outer_stage, h] = T.max(
                     QK_ACC_VIEW[outer_stage, h * 2], QK_ACC_VIEW[outer_stage, h * 2 + 1]
@@ -355,9 +358,7 @@ def flash_attention_v1(M: int, N: int, D: int):
                     ATTN_TILE_ROW_MAX_LOCAL[outer_stage, h] = T.max(
                         ATTN_TILE_ROW_MAX_LOCAL[outer_stage, h],
                         T.tvm_warp_shuffle_xor(
-                            T.uint32(
-                                0xFFFFFFFF
-                            ),  # mask，本次参与的线程集合，0xFFFFFFFF 是一个32bit，该位 = 1，代表线程参与
+                            T.uint32(0xFFFFFFFF),
                             ATTN_TILE_ROW_MAX_LOCAL[outer_stage, h],
                             1 << st,  # lane_mask，
                             4,  # 4个lane [0,3]
@@ -365,14 +366,10 @@ def flash_attention_v1(M: int, N: int, D: int):
                         ),
                     )
 
-                    # 规约，计算一行到的sum
+            # 以上计算完了每一行的最大值，接下来计算 diff，也就是新旧最大值的差值
 
-            # 完成规约之后，更新全局最大值，并且更新？
             # NOTE：有可能存在乱序问题吗？考虑两次，显然可能导致有一次漏加。
-            # 比较旧的最大值和新的，差值保存在原来的寄存器中。如果没有更新最大值则差值为0
             for h in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
-                # 更新全局最大值
-                # 全局最大值
                 z = ATTN_TILE_ROW_MAX_LOCAL[outer_stage, h] - ATTN_ROW_MAX_LOCAL[h]
                 ATTN_TILE_DIFF_LOCAL[outer_stage, h] = T.max(T.float32(0.0), z)
                 ATTN_ROW_MAX_LOCAL[h] = T.max(
@@ -380,13 +377,10 @@ def flash_attention_v1(M: int, N: int, D: int):
                     ATTN_TILE_ROW_MAX_LOCAL[outer_stage, h],
                 )
 
-            # 接下来真实计算
-
-            # res = exp(QK - Attn_max) @ V + res * exp(-attn_diff)
-
-            # 计算 res *= exp(-attn)，暂存在 RES_LOCAL
+            # 用同一行的 alpha 缩放历史输出累加器和 row sum。
             for r in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
                 alpha = T.exp(-ATTN_TILE_DIFF_LOCAL[outer_stage, r])
+                ATTN_ROW_SUM_LOCAL[r] *= alpha
                 for i in T.unroll(
                     RES_TILES
                 ):  # pyright: ignore[reportGeneralTypeIssues]
@@ -399,9 +393,31 @@ def flash_attention_v1(M: int, N: int, D: int):
                     QK_ACC_VIEW[outer_stage, i] - ATTN_ROW_MAX_LOCAL[i // 2]
                 )
 
-            # 计算 Attn_tile x V，需要预先准备 Attn tile, fp16
+            # 接下来规约，计算 attention row sum
+            for i in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
+                s = (
+                    QK_ACC_VIEW[outer_stage, i * 2]
+                    + QK_ACC_VIEW[outer_stage, i * 2 + 1]
+                )
+
+                # warp shuffle calculate row sum
+                for j in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
+                    s = s + T.tvm_warp_shuffle_xor(
+                        T.uint32(0xFFFFFFFF),
+                        s,
+                        1 << j,  # lane_mask，
+                        4,  # 4个lane [0,3]
+                        32,  # warp size
+                    )
+                # 历史 row sum 已乘 alpha，这里只累加当前块的指数和。
+                ATTN_ROW_SUM_LOCAL[i] += s
+
+            # attention tile 重新复制，float32 -> float16
             for i in T.unroll(4):  # pyright: ignore[reportGeneralTypeIssues]
-                ATTN_TILE_LOCAL[outer_stage, i] = QK_ACC_VIEW[outer_stage, i]
+                ATTN_TILE_LOCAL[outer_stage, i] = T.float16(QK_ACC_VIEW[outer_stage, i])
+
+        # 接下来真实计算
+        # res = exp(QK - Attn_max) @ V + res * exp(-attn_diff)
 
         @T.inline
         def MMA_ATTN_V(out_stage):
