@@ -509,10 +509,10 @@ def flash_attention_v1(M: int, N: int, D: int):
                     res_ptrs,
                 )
 
-            # 计算流水线结束。接下来 / attn_row_max
-            for n in T.unroll(N_STPS):  # pyright: ignore[reportGeneralTypeIssues]
-                for i in T.unroll(4):  # pyright: ignore[reportGeneralTypeIssues]
-                    RES[n, i] = RES[n, i] // QK_ROW_SUM_LOCAL[i // 2]
+            # # 计算流水线结束。接下来 / attn_row_max
+            # for n in T.unroll(N_STPS):  # pyright: ignore[reportGeneralTypeIssues]
+            #     for i in T.unroll(4):  # pyright: ignore[reportGeneralTypeIssues]
+            #         RES[n, i] = RES[n, i] // QK_ROW_SUM_LOCAL[i // 2]
 
         @T.inline
         def MMA_Q_K(out_stage):
