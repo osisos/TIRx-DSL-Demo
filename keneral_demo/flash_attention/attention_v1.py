@@ -112,10 +112,10 @@ def flash_attention_v1(M: int, N: int, D: int):
 
     @T.prim_func
     def kernel(
-        Q: T.Buffer((M, D), "float16"),
-        K: T.Buffer((N, D), "float16"),
-        V: T.Buffer((N, D), "float16"),
-        O: T.Buffer((M, D), "float16"),
+        QGMEM: T.Buffer((M, D), "float16"),
+        KGMEM: T.Buffer((N, D), "float16"),
+        VGMEM: T.Buffer((N, D), "float16"),
+        OGMEM: T.Buffer((M, D), "float16"),
     ):
         T.device_entry()
 
@@ -275,7 +275,24 @@ def flash_attention_v1(M: int, N: int, D: int):
                 # 根据地址进行搬运，经过L2缓存
                 T.ptx.cp_async(
                     KSMEM.ptr_to([stage, row, col]),
-                    K.ptr_to([row_offset + row, col]),
+                    KGMEM.ptr_to([row_offset + row, col]),
+                    16,
+                )
+
+        @T.inline
+        def LOAD_K_TO_SMEM(stage, row_offset):
+            turns = (K_TILE_N * D * 2) // (4 * 32 * 16)
+
+            per_turn_elements = (4 * 32 * 16) // 2  # 1024
+
+            for i in range(turns):  # TODO: 看下这个可以展开吗
+                idx = i * per_turn_elements + (warp_id * 32 + lane_id) * 8
+                row = idx // D
+                col = idx % D
+
+                T.ptx.cp_async(
+                    KSMEM.ptr_to([stage, row, col]),
+                    KGMEM.ptr_to([row_offset + row, col]),
                     16,
                 )
 
@@ -291,7 +308,7 @@ def flash_attention_v1(M: int, N: int, D: int):
                 # 根据地址进行搬运，经过L2缓存
                 T.ptx.cp_async(
                     VSMEM.ptr_to([outer_stage, row, col]),
-                    K.ptr_to([row_offset + row, col]),
+                    VGMEM.ptr_to([row_offset + row, col]),
                     16,
                 )
 
@@ -312,7 +329,7 @@ def flash_attention_v1(M: int, N: int, D: int):
                     col = (lane_id % 4) * 2 + (j // 2) * 8 + i * 16
 
                     Q_CP_VIEW[i, j] = T.ptx.ld(
-                        Q.ptr_to([row, col]),
+                        QGMEM.ptr_to([row, col]),
                         "uint32",
                         "b32",
                         space="global",
@@ -375,7 +392,9 @@ def flash_attention_v1(M: int, N: int, D: int):
 
             # 计算Attention的最大值，并且维护
             for i in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
-                CURR_QK_ROW_MAX[i] = T.max(QK_ACC_VIEW[i * 2], QK_ACC_VIEW[i * 2 + 1])
+                CURR_QK_ROW_MAX[i] = T.max(
+                    CURR_QK_ROW_MAX_LOCAL[i * 2], CURR_QK_ROW_MAX_LOCAL[i * 2 + 1]
+                )
 
             # 外层迭代，迭代laneid
             for st in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
@@ -410,7 +429,7 @@ def flash_attention_v1(M: int, N: int, D: int):
             # res = res * exp(x_1 - z_old)
             # 外层迭代行数
             for r in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
-                alpha = T.exp(-QK_ROW_MAX_DIFF_LOCAL[outer_stage, r])
+                alpha = T.exp(-QK_ROW_MAX_DIFF_LOCAL[r])
                 QK_ROW_SUM_LOCAL[r] *= alpha
                 # 内层迭代 res tiles
                 for i in T.unroll(
@@ -482,7 +501,7 @@ def flash_attention_v1(M: int, N: int, D: int):
 
                 if pre_n < N_STPS:
                     T.warp.copy(
-                        V[pre_s, 0:8, 0:MMA_N],
+                        V[out_stage, pre_s, 0:8, 0:MMA_N],
                         VSMEM[0:8, (pre_n * MMA_N) : ((pre_n + 1) * MMA_N)],
                         dispatch="ldstmatrix",
                     )
