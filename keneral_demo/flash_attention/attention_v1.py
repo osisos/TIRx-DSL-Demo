@@ -297,17 +297,18 @@ def flash_attention_v1(M: int, N: int, D: int):
                 )
 
         @T.inline
-        def load_v_to_smem(outer_stage, row_offset):
+        def LOAD_V_TO_SMEM(stage, row_offset):
             turns = (V_TILE_N * D * 2) // (4 * 32 * 16)
-            row_per_turns = (128 * 16) // (D * 2)
 
-            for i in range(turns):
-                row = i * row_per_turns + ((warp_id * 32 + lane_id) * 16) // (D * 2)
-                col = ((warp_id * 32 + lane_id) * 8) % D
+            per_turn_elements = (4 * 32 * 16) // 2  # 1024
 
-                # 根据地址进行搬运，经过L2缓存
+            for i in range(turns):  # TODO: 看下这个可以展开吗
+                idx = i * per_turn_elements + (warp_id * 32 + lane_id) * 8
+                row = idx // D
+                col = idx % D
+
                 T.ptx.cp_async(
-                    VSMEM.ptr_to([outer_stage, row, col]),
+                    VSMEM.ptr_to([stage, row, col]),
                     VGMEM.ptr_to([row_offset + row, col]),
                     16,
                 )
@@ -358,7 +359,7 @@ def flash_attention_v1(M: int, N: int, D: int):
         @T.inline
         def CAL_Q_K(outer_stage, k_offset):
 
-            load_k_to_smem(outer_stage, k_offset)
+            LOAD_K_TO_SMEM(outer_stage, k_offset)
             # TODO: barrier 同步加载完成，等待CTA内的所有warp加载完成
 
             # 内部实现二级流水线，计算 Q_tile * K_tile 的结果[16, 8]
@@ -392,8 +393,8 @@ def flash_attention_v1(M: int, N: int, D: int):
 
             # 计算Attention的最大值，并且维护
             for i in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
-                CURR_QK_ROW_MAX[i] = T.max(
-                    CURR_QK_ROW_MAX_LOCAL[i * 2], CURR_QK_ROW_MAX_LOCAL[i * 2 + 1]
+                CURR_QK_ROW_MAX_LOCAL[i] = T.max(
+                    QK_ACC_VIEW[i * 2], QK_ACC_VIEW[i * 2 + 1]
                 )
 
             # 外层迭代，迭代laneid
@@ -402,11 +403,11 @@ def flash_attention_v1(M: int, N: int, D: int):
                 for i in T.unroll(2):  # pyright: ignore[reportGeneralTypeIssues]
 
                     # warp shuffle 规约，迭代每一行的最大值
-                    QK_ROW_MAX_LOCAL[i] = T.max(
-                        QK_ROW_MAX_LOCAL[i],
+                    CURR_QK_ROW_MAX_LOCAL[i] = T.max(
+                        CURR_QK_ROW_MAX_LOCAL[i],
                         T.tvm_warp_shuffle_xor(
                             T.uint32(0xFFFFFFFF),
-                            QK_ROW_MAX_LOCAL[i],
+                            CURR_QK_ROW_MAX_LOCAL[i],
                             1 << st,  # lane_mask，
                             4,  # 4个lane [0,3]
                             32,  # warp size
@@ -501,8 +502,8 @@ def flash_attention_v1(M: int, N: int, D: int):
 
                 if pre_n < N_STPS:
                     T.warp.copy(
-                        V[out_stage, pre_s, 0:8, 0:MMA_N],
-                        VSMEM[0:8, (pre_n * MMA_N) : ((pre_n + 1) * MMA_N)],
+                        V[pre_s, 0:8, 0:MMA_N],
+                        VSMEM[out_stage, 0:8, (pre_n * MMA_N) : ((pre_n + 1) * MMA_N)],
                         dispatch="ldstmatrix",
                     )
 
@@ -512,7 +513,7 @@ def flash_attention_v1(M: int, N: int, D: int):
                 # 当前流水线槽内的一个 b32，保存 V 的两个 FP16 元素。
                 v_ptrs = [V_B32_VIEW.ptr_to([s, 0])]
 
-                res_ptrs = [RES_LOCAL.ptr_to([n, 0])]
+                res_ptrs = [RES_LOCAL.ptr_to([n, i]) for i in range(4)]
 
                 T.ptx.mma(
                     "m16n8k8",
