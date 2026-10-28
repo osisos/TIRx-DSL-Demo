@@ -358,7 +358,7 @@ def flash_attention_v1(M: int, N: int, D: int):
         # 内层PIPE LINE
         @T.inline
         def CAL_Q_K(outer_stage, k_offset):
-
+            # 加载K REG到smem
             LOAD_K_TO_SMEM(outer_stage, k_offset)
             # TODO: barrier 同步加载完成，等待CTA内的所有warp加载完成
 
