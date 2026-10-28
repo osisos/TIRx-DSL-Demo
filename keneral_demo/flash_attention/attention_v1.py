@@ -140,10 +140,35 @@ def flash_attention_v1(M: int, N: int, D: int):
             layout=V_SMEM_LAYOUT,
         )
 
-        SMEM_READY_BAR = pool.alloc((OUTER_STAGE,), "uint64", align=8)
-        SMEM_FREE_BAR = pool.alloc((OUTER_STAGE,), "uint64", align=8)
+        K_SMEM_READY_BAR = pool.alloc((OUTER_STAGE,), "uint64", align=8)
+        K_SMEM_FREE_BAR = pool.alloc((OUTER_STAGE,), "uint64", align=8)
+
+        V_SMEM_READY_BAR = pool.alloc((OUTER_STAGE,), "uint64", align=8)
+        V_SMEM_FREE_BAR = pool.alloc((OUTER_STAGE,), "uint64", align=8)
 
         pool.commit()
+
+        # --- mbarrier 初始化  ---
+
+        if warp_id == 0 and lane_id == 0:
+            for i in range(OUTER_STAGE):
+                T.ptx.mbarrier.init(K_SMEM_READY_BAR.ptr_to([i]), 128)
+                T.ptx.mbarrier.init(V_SMEM_READY_BAR.ptr_to([i]), 128)
+                T.ptx.mbarrier.init(K_SMEM_FREE_BAR.ptr_to([i]), 128)
+                T.ptx.mbarrier.init(V_SMEM_FREE_BAR.ptr_to([i]), 128)
+
+        T.cuda.cta_sync()  # TODO: 这一行的作用
+
+        # 其实不需要初始化 [FREE\READY PHASE]
+        k_ready_phase = T.alloc_local((OUTER_STAGE,), "uint32")
+        k_free_phase = T.alloc_local((OUTER_STAGE,), "uint32")
+        v_free_phase = T.alloc_local((OUTER_STAGE,), "uint32")
+        v_ready_phase = T.alloc_local((OUTER_STAGE,), "unit32")
+        for i in T.unroll(4):  # pyright: ignore[reportGeneralTypeIssues]
+            k_free_phase[i] = 0
+            k_ready_phase[i] = 0
+            v_ready_phase[i] = 0
+            v_free_phase[i] = 0
 
         # --- Q寄存器 ---
         """
@@ -261,29 +286,15 @@ def flash_attention_v1(M: int, N: int, D: int):
 
         # 这里的核心设计是，4个warp共同加载一个 k_tile [8, head_dim] 到 smem（完整的），K V 有一个CTA的4个warp的共同负责
         @T.inline
-        def load_k_to_smem(stage, row_offset):
-            # 一轮加载的总字节数//一轮总加载数(4 * 32) * 16B
-            turns = (K_TILE_N * D * 2) // (4 * 32 * 16)
-            # if turns == 0: # 不足一轮 D < 128
-            row_per_turns = (128 * 16) // (D * 2)
-
-            # 计算搬运起始位置，假设head dim > 128
-            for i in range(turns):
-                row = i * row_per_turns + ((warp_id * 32 + lane_id) * 16) // (D * 2)
-                col = ((warp_id * 32 + lane_id) * 8) % D
-
-                # 根据地址进行搬运，经过L2缓存
-                T.ptx.cp_async(
-                    KSMEM.ptr_to([stage, row, col]),
-                    KGMEM.ptr_to([row_offset + row, col]),
-                    16,
-                )
-
-        @T.inline
         def LOAD_K_TO_SMEM(stage, row_offset):
             turns = (K_TILE_N * D * 2) // (4 * 32 * 16)
 
             per_turn_elements = (4 * 32 * 16) // 2  # 1024
+
+            # NOTE: [Local Memory 风险 - 循环未展开导致动态索引]
+            # 此处使用普通 range(Q_TILES) 而非 T.unroll(Q_TILES)，循环变量 i 在 TIR 中是运行时变量。
+            # 下方 Q_CP_VIEW[i, j] 使用 i 索引寄存器视图，若后端未自动完全展开该循环，
+            # 会导致整个 Q_REG 因运行时动态寻址而被分配到 Local Memory！应改为 T.unroll(Q_TILES)。
 
             for i in range(turns):  # TODO: 看下这个可以展开吗
                 idx = i * per_turn_elements + (warp_id * 32 + lane_id) * 8
@@ -312,43 +323,85 @@ def flash_attention_v1(M: int, N: int, D: int):
                     VGMEM.ptr_to([row_offset + row, col]),
                     16,
                 )
-
-        # Q加载到REG，由于Q是每个warp单独负责计算的，因此Q直接写入每个warp的REG，可以参与的线程只有32个
-        @T.inline
-        def load_q_to_req():
-            # Q_tile = [16, 16]
-
-            # NOTE: [Local Memory 风险 - 循环未展开导致动态索引]
-            # 此处使用普通 range(Q_TILES) 而非 T.unroll(Q_TILES)，循环变量 i 在 TIR 中是运行时变量。
-            # 下方 Q_CP_VIEW[i, j] 使用 i 索引寄存器视图，若后端未自动完全展开该循环，
-            # 会导致整个 Q_REG 因运行时动态寻址而被分配到 Local Memory！应改为 T.unroll(Q_TILES)。
-
-            for i in range(Q_TILES):
-                # 内层循环，一个循环负责加载4个元素，(16 * 16) / 32 = 4
-                for j in T.unroll(4):  # pyright: ignore[reportGeneralTypeIssues]
-                    row = lane_id // 4 + (j % 2) * 8  # 行数
-                    col = (lane_id % 4) * 2 + (j // 2) * 8 + i * 16
-
-                    Q_CP_VIEW[i, j] = T.ptx.ld(
-                        QGMEM.ptr_to([row, col]),
-                        "uint32",
-                        "b32",
-                        space="global",
-                    )
+                # 阻塞等待，确定轮次完成后才继续执行。
 
         @T.inline
-        def flash_attn(q_tile, k, v, o_tile, q_row_start):
-            # Buffer / view 参数引用已有存储，不在接口处复制数据。
-            # q_tile: float16[Q_TILE_M, D]，完整 Q 块，块内行号从 0 开始。
-            # k、v:   float16[N, D]，完整 K/V 序列的全局内存 Buffer。
-            # o_tile: float16[Q_TILE_M, D]，写入当前 Q 块对应的输出。
-            # 当前接口约定：非 causal，无尾块；N % K_V_TILE_N == 0，D % MMA_K == 0。
-            # 目标：o_tile = softmax(q_tile @ k.T / sqrt(D)) @ v。
-            # TODO: 初始化逐行 max、sum 和 float32 输出累加器。
-            # TODO: 遍历 K/V tiles，执行 QK、online softmax 和 PV 累加。
-            # TODO: 用逐行 sum 归一化累加结果，转换为 float16 写入 o_tile。
-            # 仅定义接口，计算实现待补充。
+        def wait_phase(bar, p):  # bar = 地址， p = 数值
+            while T.ptx.mbarrier_test_wait_parity(bar, p) == 0:  # 非阻塞等待？
+                T.evaluate(0)  # TODO: 这个是对的吗？
+
+        # NOTE: 这个函数不对，应该需要传入4个warp的Q最大值！
+        @T.inline
+        def flash_attn(cta_q_row_start):
+            # CTA 协作入口：所有线程以相同的 cta_q_row_start 调用。
+            # 一次处理 WARP_PER_CTA * Q_TILE_M 行 Q；每个 warp 负责其中 Q_TILE_M 行：
+            # q_row_start = cta_q_row_start + warp_id * Q_TILE_M。
+            # QGMEM/KGMEM/VGMEM/OGMEM、寄存器、SMEM 和 barrier 均引用外层存储。
+            # 每个 warp 的目标：
+            # OGMEM[q_row_start:q_row_start+Q_TILE_M, :] =
+            #     softmax(QGMEM[q_row_start:q_row_start+Q_TILE_M, :] @ KGMEM.T / sqrt(D)) @ VGMEM。
+            # 接口范围：非 causal，Q/K/V 均无尾块，K_TILE_N == V_TILE_N。
+            # 调用方保证整个 CTA 的 Q 行范围有效；N % K_TILE_N == 0。
+            # D 还需满足现有加载 helper 和 MMA 的分块约束。
+
+            # TODO: 按 q_row_start 加载当前 warp 的 Q，重置该 Q 块的 max/sum/RES。
+            # TODO: CTA 共同预取 K/V，并遍历 kv_tile_idx in range(N // K_TILE_N)。
+            #       kv_row_start = kv_tile_idx * K_TILE_N，stage = kv_tile_idx % OUTER_STAGE。
+            #       管理槽位的 ready/free 等待与 phase，串联 QK -> ATTN_ROW -> MMA_ATTN_V。
+            #       所有 warp 必须参与同一套 CTA 搬运和同步流程。
+            # TODO: 遍历结束后，逐行执行 RES / sum，并按 q_row_start 写回 OGMEM。
+            # NOTE: 外层序列循环与寄存器索引循环分别考虑展开策略。
+            # 仅定义接口；加载、流水线和写回实现待补充。
             T.evaluate(0)
+
+            # 每个warp 负责一个Q_TILE的计算
+            start = cta_q_row_start
+            end = cta_q_row_start + Q_TILE_M  # end
+
+            main_turns = end // D
+
+            for s in T.unroll(
+                OUTER_STAGE - 1
+            ):  #  pyright: ignore[reportGeneralTypeIssues]
+                if s < main_turns:
+                    # 预加载K
+                    # 发起 K, V 从 global memory -> share memory
+                    row_offset = s * MMA_N
+                    LOAD_K_TO_SMEM(s, row_offset)  # 加载K
+                    # 全 CTA 每个线程各执行一次；两条指令都传 barrier 地址。
+                    # 默认非 noinc：先增加一个 pending arrival，先前的 cp.async
+                    # 全部完成后异步抵消它；再用普通 arrive 抵消 init(128) 的线程计数。
+                    # 必须先登记异步完成事件，再报告线程到达，避免 barrier 提前完成。
+                    T.ptx.cp_async.mbarrier.arrive(K_SMEM_READY_BAR.ptr_to([s]))
+                    T.ptx.mbarrier.arrive(K_SMEM_READY_BAR.ptr_to([s]))
+
+            # main loop
+            for i in range(end // D):
+                s = i % OUTER_STAGE
+
+                # 等待k加载完成
+                wait_phase(K_SMEM_READY_BAR.ptr_to([s]), k_ready_phase[s])
+
+                # k 加载完成，异步发起v的加载
+                LOAD_V_TO_SMEM(s, row_offset)
+                # 提交 v ready，等待加载完成
+                T.ptx.cp_async.mbarrier.arrive(V_SMEM_READY_BAR.ptr_to([s]))
+                T.ptx.mbarrier.arrive(V_SMEM_READY_BAR.ptr_to([s]))
+
+                # 发起计算Q @ K的计算
+                CAL_Q_K(s)
+
+                # 计算完成，标记 K SMEM 使用完成 -- （这个似乎需要4个warp的同步）
+                T.ptx.mbarrier.arrive(K_SMEM_FREE_BAR.ptr_to([s]))
+                wait_phase(K_SMEM_FREE_BAR.ptr_to([s]), k_free_phase[s])
+
+                # 等待 v 加载完成 TODO: 这个有可能发射不足吗？似乎 依赖 CAL_Q_K 耗时 > LOAD_V ?
+                wait_phase(V_SMEM_READY_BAR.ptr_to([s]), v_ready_phase[s])
+                MMA_ATTN_V(s)
+
+                # 报告 v 使用完成
+                T.ptx.mbarrier.arrive(V_SMEM_FREE_BAR.ptr_to([s]))
+                wait_phase(V_SMEM_FREE_BAR.ptr_to([s]), v_free_phase[s])
 
         @T.inline
         def CLEAN_QK_REG():
@@ -357,10 +410,7 @@ def flash_attention_v1(M: int, N: int, D: int):
 
         # 内层PIPE LINE
         @T.inline
-        def CAL_Q_K(outer_stage, k_offset):
-            # 加载K REG到smem
-            LOAD_K_TO_SMEM(outer_stage, k_offset)
-            # TODO: barrier 同步加载完成，等待CTA内的所有warp加载完成
+        def CAL_Q_K(outer_stage):
 
             # 内部实现二级流水线，计算 Q_tile * K_tile 的结果[16, 8]
             # 清理QK Acc
@@ -371,6 +421,7 @@ def flash_attention_v1(M: int, N: int, D: int):
             # Q x K_TILE^T的片段行内规约，online_softmax(Q x K_TILE ^T)
 
             # attention_tile x v_tile, 结果累加到 res 中
+            ATTN_ROW(outer_stage)
 
         @T.inline
         def ATTN_ROW(outer_stage):
