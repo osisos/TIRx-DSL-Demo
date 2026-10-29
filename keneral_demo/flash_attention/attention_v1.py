@@ -397,6 +397,9 @@ def flash_attention_v1(M: int, N: int, D: int):
 
                 # 等待 v 加载完成 TODO: 这个有可能发射不足吗？似乎 依赖 CAL_Q_K 耗时 > LOAD_V ?
                 wait_phase(V_SMEM_READY_BAR.ptr_to([s]), v_ready_phase[s])
+
+                # TODO: 从此处发起异步加载下一个阶段的K
+
                 MMA_ATTN_V(s)
 
                 # 报告 v 使用完成
