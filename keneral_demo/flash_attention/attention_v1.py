@@ -163,8 +163,8 @@ def flash_attention_v1(M: int, N: int, D: int):
         k_ready_phase = T.alloc_local((OUTER_STAGE,), "uint32")
         k_free_phase = T.alloc_local((OUTER_STAGE,), "uint32")
         v_free_phase = T.alloc_local((OUTER_STAGE,), "uint32")
-        v_ready_phase = T.alloc_local((OUTER_STAGE,), "unit32")
-        for i in T.unroll(4):  # pyright: ignore[reportGeneralTypeIssues]
+        v_ready_phase = T.alloc_local((OUTER_STAGE,), "uint32")
+        for i in T.unroll(OUTER_STAGE):  # pyright: ignore[reportGeneralTypeIssues]
             k_free_phase[i] = 0
             k_ready_phase[i] = 0
             v_ready_phase[i] = 0
@@ -358,7 +358,7 @@ def flash_attention_v1(M: int, N: int, D: int):
             start = cta_q_row_start
             end = cta_q_row_start + Q_TILE_M  # end
 
-            main_turns = end // D
+            main_turns = end // K_TILE_N
 
             for s in T.unroll(
                 OUTER_STAGE - 1
@@ -376,13 +376,15 @@ def flash_attention_v1(M: int, N: int, D: int):
                     T.ptx.mbarrier.arrive(K_SMEM_READY_BAR.ptr_to([s]))
 
             # main loop
-            for i in range(end // D):
+            for i in range(main_turns):
                 s = i % OUTER_STAGE
 
                 # 等待k加载完成
                 wait_phase(K_SMEM_READY_BAR.ptr_to([s]), k_ready_phase[s])
+                k_ready_phase[s] = k_ready_phase[s] ^ T.uint32(1)
 
                 # k 加载完成，异步发起v的加载
+                row_offset = i * MMA_N
                 LOAD_V_TO_SMEM(s, row_offset)
                 # 提交 v ready，等待加载完成
                 T.ptx.cp_async.mbarrier.arrive(V_SMEM_READY_BAR.ptr_to([s]))
@@ -394,17 +396,28 @@ def flash_attention_v1(M: int, N: int, D: int):
                 # 计算完成，标记 K SMEM 使用完成 -- （这个似乎需要4个warp的同步）
                 T.ptx.mbarrier.arrive(K_SMEM_FREE_BAR.ptr_to([s]))
                 wait_phase(K_SMEM_FREE_BAR.ptr_to([s]), k_free_phase[s])
+                k_free_phase[s] = k_free_phase[s] ^ T.uint32(1)
 
                 # 等待 v 加载完成 TODO: 这个有可能发射不足吗？似乎 依赖 CAL_Q_K 耗时 > LOAD_V ?
                 wait_phase(V_SMEM_READY_BAR.ptr_to([s]), v_ready_phase[s])
+                v_ready_phase[s] = v_ready_phase[s] ^ T.uint32(1)
 
                 # TODO: 从此处发起异步加载下一个阶段的K
+                next_k = i + OUTER_STAGE - 1
+                if next_k < main_turns:
+                    # 加载下一个阶段的K
+                    next_row_offset = next_k * K_TILE_N
+                    next_s = next_k % OUTER_STAGE
+                    LOAD_K_TO_SMEM(next_s, next_row_offset)
+                    T.ptx.cp_async.mbarrier.arrive(K_SMEM_READY_BAR.ptr_to([next_s]))
+                    T.ptx.mbarrier.arrive(K_SMEM_READY_BAR.ptr_to([next_s]))
 
                 MMA_ATTN_V(s)
 
                 # 报告 v 使用完成
                 T.ptx.mbarrier.arrive(V_SMEM_FREE_BAR.ptr_to([s]))
                 wait_phase(V_SMEM_FREE_BAR.ptr_to([s]), v_free_phase[s])
+                v_free_phase[s] = v_free_phase[s] ^ T.uint32(1)
 
         @T.inline
         def CLEAN_QK_REG():
