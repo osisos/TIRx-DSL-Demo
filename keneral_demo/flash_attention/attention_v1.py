@@ -331,8 +331,9 @@ def flash_attention_v1(M: int, N: int, D: int):
                 T.evaluate(0)  # TODO: 这个是对的吗？
 
         # NOTE: 这个函数不对，应该需要传入4个warp的Q最大值！
+        # 这里仅处理全速块
         @T.inline
-        def flash_attn(cta_q_row_start):
+        def Flash_Attention(cta_q_idx):
             # CTA 协作入口：所有线程以相同的 cta_q_row_start 调用。
             # 一次处理 WARP_PER_CTA * Q_TILE_M 行 Q；每个 warp 负责其中 Q_TILE_M 行：
             # q_row_start = cta_q_row_start + warp_id * Q_TILE_M。
@@ -347,7 +348,7 @@ def flash_attention_v1(M: int, N: int, D: int):
             # TODO: 按 q_row_start 加载当前 warp 的 Q，重置该 Q 块的 max/sum/RES。
             # TODO: CTA 共同预取 K/V，并遍历 kv_tile_idx in range(N // K_TILE_N)。
             #       kv_row_start = kv_tile_idx * K_TILE_N，stage = kv_tile_idx % OUTER_STAGE。
-            #       管理槽位的 ready/free 等待与 phase，串联 QK -> ATTN_ROW -> MMA_ATTN_V。
+            #       管理槽位的 ready/free 等待与 phase，串联 MMA_Q_K -> ONLINE_SOFTMAX -> MMA_ATTN_V。
             #       所有 warp 必须参与同一套 CTA 搬运和同步流程。
             # TODO: 遍历结束后，逐行执行 RES / sum，并按 q_row_start 写回 OGMEM。
             # NOTE: 外层序列循环与寄存器索引循环分别考虑展开策略。
@@ -355,10 +356,11 @@ def flash_attention_v1(M: int, N: int, D: int):
             T.evaluate(0)
 
             # 每个warp 负责一个Q_TILE的计算
-            start = cta_q_row_start
-            end = cta_q_row_start + Q_TILE_M  # end
+            kv_len = cta_q_idx + 4 * Q_TILE_M  # NOTE: 这里假设 kv 没有超过序列长度
 
-            main_turns = end // K_TILE_N
+            main_turns = kv_len // K_TILE_N
+
+            q_idx = cta_q_idx + warp_id * Q_TILE_M  # 当前warp负责的q idx 起点
 
             for s in T.unroll(
                 OUTER_STAGE - 1
@@ -366,8 +368,8 @@ def flash_attention_v1(M: int, N: int, D: int):
                 if s < main_turns:
                     # 预加载K
                     # 发起 K, V 从 global memory -> share memory
-                    row_offset = s * MMA_N
-                    LOAD_K_TO_SMEM(s, row_offset)  # 加载K
+                    kv_idx = s * MMA_N
+                    LOAD_K_TO_SMEM(s, kv_idx)  # 加载K
                     # 全 CTA 每个线程各执行一次；两条指令都传 barrier 地址。
                     # 默认非 noinc：先增加一个 pending arrival，先前的 cp.async
                     # 全部完成后异步抵消它；再用普通 arrive 抵消 init(128) 的线程计数。
@@ -384,21 +386,27 @@ def flash_attention_v1(M: int, N: int, D: int):
                 k_ready_phase[s] = k_ready_phase[s] ^ T.uint32(1)
 
                 # k 加载完成，异步发起v的加载
-                row_offset = i * MMA_N
-                LOAD_V_TO_SMEM(s, row_offset)
+                kv_idx = i * MMA_N
+                LOAD_V_TO_SMEM(s, kv_idx)
                 # 提交 v ready，等待加载完成
                 T.ptx.cp_async.mbarrier.arrive(V_SMEM_READY_BAR.ptr_to([s]))
                 T.ptx.mbarrier.arrive(V_SMEM_READY_BAR.ptr_to([s]))
 
-                # 发起计算Q @ K的计算
-                CAL_Q_K(s)
-
+                # 计算 Q @ K^T，再更新 online softmax 状态和 attention 片段。
+                MMA_Q_K(s, q_idx, kv_idx)
                 # 计算完成，标记 K SMEM 使用完成 -- （这个似乎需要4个warp的同步）
                 T.ptx.mbarrier.arrive(K_SMEM_FREE_BAR.ptr_to([s]))
+
+                # mask
+                CAUSAL_MASK(OUTER_STAGE, q_idx, kv_idx)
+                # online soft max
+                ONLINE_SOFTMAX()
+
+                # 等待其他线程的 K smem 使用完毕
                 wait_phase(K_SMEM_FREE_BAR.ptr_to([s]), k_free_phase[s])
                 k_free_phase[s] = k_free_phase[s] ^ T.uint32(1)
 
-                # 等待 v 加载完成 TODO: 这个有可能发射不足吗？似乎 依赖 CAL_Q_K 耗时 > LOAD_V ?
+                # 等待 v 加载完成 TODO: 这个有可能发射不足吗？似乎依赖 MMA_Q_K + ONLINE_SOFTMAX 耗时 > LOAD_V ?
                 wait_phase(V_SMEM_READY_BAR.ptr_to([s]), v_ready_phase[s])
                 v_ready_phase[s] = v_ready_phase[s] ^ T.uint32(1)
 
@@ -412,7 +420,7 @@ def flash_attention_v1(M: int, N: int, D: int):
                     T.ptx.cp_async.mbarrier.arrive(K_SMEM_READY_BAR.ptr_to([next_s]))
                     T.ptx.mbarrier.arrive(K_SMEM_READY_BAR.ptr_to([next_s]))
 
-                MMA_ATTN_V(s)
+                MMA_ATTN_V(s, q_idx, kv_idx)
 
                 # 报告 v 使用完成
                 T.ptx.mbarrier.arrive(V_SMEM_FREE_BAR.ptr_to([s]))
@@ -424,35 +432,18 @@ def flash_attention_v1(M: int, N: int, D: int):
             for i in T.unroll((4)):  # pyright: ignore[reportGeneralTypeIssues]
                 QK_LOCAL_VIEW[i] = T.float32(0.0)
 
-        # 内层PIPE LINE
         @T.inline
-        def CAL_Q_K(outer_stage):
-
-            # 内部实现二级流水线，计算 Q_tile * K_tile 的结果[16, 8]
-            # 清理QK Acc
-            CLEAN_QK_REG()
-
-            MMA_Q_K(outer_stage)  # 计算出一个Attention的小块
-
-            # Q x K_TILE^T的片段行内规约，online_softmax(Q x K_TILE ^T)
-
-            # attention_tile x v_tile, 结果累加到 res 中
-            ATTN_ROW(outer_stage)
-
-        @T.inline
-        def ATTN_ROW(outer_stage):
+        def ONLINE_SOFTMAX(q_idx, kv_idx):
             """
-            Attention 计算过程分为两步
-            1. 计算 Q_TILE x K_TILE ^ T, 并执行规约
+            对当前 QK 片段执行 online softmax：更新逐行 max/sum，
+            重缩放 RES，并生成供 MMA_ATTN_V 使用的 FP16 attention 片段。
             """
             # QK 连续视图
             # [0, 1] <-> [[0,0], [0,1]]
             # [2, 3] <-> [[8,0], [8,1]]
-
-            # NOTE: [Local Memory 风险 - 运行时 outer_stage 索引局部数组]
-            # 本函数中所有 [outer_stage, ...] 下标访问（ATTN_TILE_ROW_MAX_LOCAL、QK_ACC_VIEW、ATTN_TILE_DIFF_LOCAL），
-            # 如果调用方传入的 outer_stage 是运行时变量（例如 ko % OUTER_STAGE），
-            # 这三个 T.alloc_local 缓冲区都会因非常量索引退化到 Local Memory。
+            if q_idx + Q_TILE_M <= kv_idx:
+                # 直接跳过计算
+                return
 
             # softmax 的输入为 QK / sqrt(D)，先缩放再计算逐行 max、exp 和 sum。
             for i in T.unroll(4):  # pyright: ignore[reportGeneralTypeIssues]
@@ -530,11 +521,35 @@ def flash_attention_v1(M: int, N: int, D: int):
             for i in T.unroll(4):  # pyright: ignore[reportGeneralTypeIssues]
                 ATTN_LOCAL[i] = T.float16(QK_ACC_VIEW[i])
 
+        @T.inline
+        def CAUSAL_MASK(out_stage, q_idx, kv_idx):
+
+            # 直接跳过逻辑
+            if q_idx + Q_TILE_M <= kv_idx:
+                return
+            if kv_idx + K_TILE_N <= q_idx:
+                return
+
+            k_base_offset = (lane_id % 4) * 2
+            q_base = lane_id // 4
+            # 计算
+            for i in T.unroll(4):  # pyright: ignore[reportGeneralTypeIssues]
+                q_ = q_idx + q_base + (i // 2) * 8
+                k_ = kv_idx + k_base_offset + i % 2
+
+                if q_ < k_:
+                    QK_ACC_VIEW[i] = T.float32(float("-inf"))
+
         # 接下来真实计算
         # res = exp(QK - Attn_max) @ V + res * exp(-attn_diff)
 
         @T.inline
-        def MMA_ATTN_V(out_stage):
+        def MMA_ATTN_V(out_stage, q_idx, kv_idx):
+
+            # 跳过计算逻辑
+            if q_idx + Q_TILE_M <= kv_idx:
+                return
+
             # 计算ATTN x V，规约的中间维度 = 8
             # RES = RES + ATTN x V，其中, ATTN = fp32, V = fp16
 
@@ -602,7 +617,17 @@ def flash_attention_v1(M: int, N: int, D: int):
             #         RES[n, i] = RES[n, i] // QK_ROW_SUM_LOCAL[i // 2]
 
         @T.inline
-        def MMA_Q_K(out_stage):
+        def MMA_Q_K(out_stage, q_idx, k_idx):
+            # q_tile: [q_idx, q_idx + 16]
+            # k_tile: [k_idx, k_idx + 8]
+            # 跳过计算逻辑
+            if q_idx + Q_TILE_M <= k_idx:
+                # 直接跳过计算
+                return
+
+            # 每个 K tile 独立计算 Q @ K^T，先清零当前 QK 累加器。
+            CLEAN_QK_REG()
+
             # QxK的中间规约维度是16
             K_STPS = D // 16
             # 实现一个内层流水线，注意，load_smem_to_reg 是可以使用寄存器依赖检查来同步的，不需要手动写同步原语
