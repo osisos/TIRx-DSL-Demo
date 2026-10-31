@@ -689,4 +689,19 @@ def flash_attention_v1(M: int, N: int, D: int):
                     c_ptrs,
                 )
 
+        @T.inline
+        def NORMALIZE_RES():
+            """
+            softmax的执行过程，我们对 attention x v 的累加，没有除 sum，需要在最后归一化一次
+            """
+            t = D // K_TILE_N
+            alpha_0 = 1 / QK_ROW_SUM_LOCAL[0]
+            alpha_1 = 1 / QK_ROW_SUM_LOCAL[1]
+
+            for i in T.unroll(t):  # pyright: ignore[reportGeneralTypeIssues]
+                RES_LOCAL[i, 0] *= alpha_0
+                RES_LOCAL[i, 1] *= alpha_0
+                RES_LOCAL[i, 2] *= alpha_1
+                RES_LOCAL[i, 3] *= alpha_1
+
     return kernel
