@@ -1,11 +1,11 @@
 from typing import cast
 
 import tvm
+from tvm.backend.cuda.lang.tile_scheduler import ClusterPersistentScheduler2D
+from tvm.backend.cuda.tile_primitive.tma_utils import SwizzleMode, mma_shared_layout
 from tvm.ir import Var
 from tvm.tirx import script as T
-from tvm.tirx.layout import TileLayout, S, R, laneid, warpid
-from tvm.backend.cuda.tile_primitive.tma_utils import mma_shared_layout, SwizzleMode
-from tvm.backend.cuda.lang.tile_scheduler import ClusterPersistentScheduler2D
+from tvm.tirx.layout import R, S, TileLayout, laneid, warpid
 from tvm.tirx.script import tile as Tx
 
 BLOCK_CNT = 66
@@ -689,6 +689,16 @@ def flash_attention_v1(M: int, N: int, D: int):
                     c_ptrs,
                 )
 
+        # TODO: [明天复盘 - Local Memory 退化原理与排查]
+        # 1. 硬件本质：GPU 寄存器没有内存地址，SASS 指令必须将寄存器号（R0~R254）静态硬编码在指令中，
+        #    不支持运行时算地址 R[base + i]。一旦退化到 Local Memory，物理上就是走慢速 Global Memory (+ L1/L2)。
+        # 2. 退化原因 A（动态下标）：对 T.alloc_local 数组使用未展开的 range() 变量或运行时变量（如 s = i % 2）作下标。
+        #    （注意检查 k_ready_phase[s] 等数组是否因运行时 s 索引而落入 Local Memory）。
+        # 3. 退化原因 B（动态指针 / 跨位宽原位强转 In-place Type Punning）：
+        #    - 对局部数组取非常量偏移指针 &arr[var]（Pointer Escape，如 MMA 中 pre_s / s 未常量折叠）。
+        #    - 对同一块局部缓冲混用不同位宽指针原位改写（如在 float32 数组上套 float16*/uint32* 视图原位覆写），
+        #      会破坏 NVCC/LLVM 的 SROA（标量替换）别名分析，导致编译器放弃映射到 32-bit 寄存器并整体退化到 Local Memory。
+        #    - 需检查 Q_CP_VIEW / K_B32_VIEW / V_B32_VIEW / ATTN_B32_VIEW 生成的 CUDA C 代码是否触发指针别名退化。
         @T.inline
         def NORMALIZE_RES():
             """
