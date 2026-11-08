@@ -5,9 +5,9 @@ from tvm.tirx.layout import TileLayout, S, TLane, TCol, tid_in_wg
 from tvm.backend.cuda.tile_primitive.tma_utils import mma_shared_layout, SwizzleMode
 from tvm.backend.cuda.lang.tile_scheduler import ClusterPersistentScheduler2D
 
-
 SM_COUNT = 148  # Number of SMs on NVIDIA B200 GPU
 PIPE_DEPTH = 2
+
 
 def hgemm_v6(M, N, K):
     a_type = tvm.DataType("float16")
@@ -18,16 +18,17 @@ def hgemm_v6(M, N, K):
     BLK_M, BLK_N, BLK_K = 128, 128, 64
     assert K % BLK_K == 0, "K must be divisible by BLK_K"
     K_TILES = K // BLK_K
-    assert K_TILES % (2 * PIPE_DEPTH) == 0, (
-        "K_TILES must be divisible by 2 * PIPE_DEPTH"
-    )
+    assert (
+        K_TILES % (2 * PIPE_DEPTH) == 0
+    ), "K_TILES must be divisible by 2 * PIPE_DEPTH"
 
-    A_layout = mma_shared_layout(a_type, SwizzleMode.SWIZZLE_128B_ATOM,
-                                  (PIPE_DEPTH, BLK_M, BLK_K))
-    B_layout = mma_shared_layout(b_type, SwizzleMode.SWIZZLE_128B_ATOM,
-                                  (PIPE_DEPTH, BLK_N, BLK_K))
-    D_layout = mma_shared_layout(d_type, SwizzleMode.SWIZZLE_128B_ATOM,
-                                  (BLK_M, BLK_N))
+    A_layout = mma_shared_layout(
+        a_type, SwizzleMode.SWIZZLE_128B_ATOM, (PIPE_DEPTH, BLK_M, BLK_K)
+    )
+    B_layout = mma_shared_layout(
+        b_type, SwizzleMode.SWIZZLE_128B_ATOM, (PIPE_DEPTH, BLK_N, BLK_K)
+    )
+    D_layout = mma_shared_layout(d_type, SwizzleMode.SWIZZLE_128B_ATOM, (BLK_M, BLK_N))
 
     @T.prim_func
     def kernel(
@@ -65,8 +66,11 @@ def hgemm_v6(M, N, K):
         T.cuda.cta_sync()
 
         tmem = T.decl_buffer(
-            (128, 512), acc_type, scope="tmem", allocated_addr=tmem_addr[0],
-            layout=TileLayout(S[(128, 512) : (1@TLane, 1@TCol)])
+            (128, 512),
+            acc_type,
+            scope="tmem",
+            allocated_addr=tmem_addr[0],
+            layout=TileLayout(S[(128, 512) : (1 @ TLane, 1 @ TCol)]),
         )
 
         # Tile scheduler：按有利于 L2 locality 的顺序将 tiles 分配给 CTAs
@@ -75,7 +79,7 @@ def hgemm_v6(M, N, K):
             num_m_tiles=M // BLK_M,
             num_n_tiles=N // BLK_N,
             l2_group_size=8,
-            num_clusters=SM_COUNT
+            num_clusters=SM_COUNT,
         )
         tile_scheduler.init(bx)
 
@@ -83,24 +87,37 @@ def hgemm_v6(M, N, K):
 
         @T.inline
         def tma_load(stage, k_offset, m_st, n_st):
-            tma_config = T.meta_var({
-                "dispatch": "tma_auto", "cta_group": 1,
-                "mbar": tma_bar.ptr_to([stage])
-            })
-            Tx.copy_async(Asmem[stage, :, :],
-                          A[m_st:m_st+BLK_M, k_offset:k_offset+BLK_K],
-                          **tma_config)
-            Tx.copy_async(Bsmem[stage, :, :],
-                          B[n_st:n_st+BLK_N, k_offset:k_offset+BLK_K],
-                          **tma_config)
+            tma_config = T.meta_var(
+                {
+                    "dispatch": "tma_auto",
+                    "cta_group": 1,
+                    "mbar": tma_bar.ptr_to([stage]),
+                }
+            )
+            Tx.copy_async(
+                Asmem[stage, :, :],
+                A[m_st : m_st + BLK_M, k_offset : k_offset + BLK_K],
+                **tma_config
+            )
+            Tx.copy_async(
+                Bsmem[stage, :, :],
+                B[n_st : n_st + BLK_N, k_offset : k_offset + BLK_K],
+                **tma_config
+            )
             T.ptx.mbarrier.arrive.expect_tx(
-                tma_bar.ptr_to([stage]),
-                (BLK_M * BLK_K + BLK_N * BLK_K) * F16_SIZE)
+                tma_bar.ptr_to([stage]), (BLK_M * BLK_K + BLK_N * BLK_K) * F16_SIZE
+            )
 
         @T.inline
         def mma(stage, accum):
-            Tx.gemm_async(tmem[:, :BLK_N], Asmem[stage, :, :], Bsmem[stage, :, :],
-                          accum=accum, dispatch="tcgen05", cta_group=1)
+            Tx.gemm_async(
+                tmem[:, :BLK_N],
+                Asmem[stage, :, :],
+                Bsmem[stage, :, :],
+                accum=accum,
+                dispatch="tcgen05",
+                cta_group=1,
+            )
             T.ptx.tcgen05.commit(mma_bar.ptr_to([0]), cta_group=1)
 
         # === Outer loop: iterate over tiles ===
@@ -136,8 +153,9 @@ def hgemm_v6(M, N, K):
             # === TMA Store Writeback: TMEM -> RF -> Dsmem -> TMA -> GMEM ===
             Dreg = T.alloc_local((BLK_N,), acc_type)
             Dreg_f16 = T.alloc_local((BLK_N,), d_type)
-            Dreg_wg = Dreg.view(128, BLK_N,
-                                layout=TileLayout(S[(128, BLK_N) : (1@tid_in_wg, 1)]))
+            Dreg_wg = Dreg.view(
+                128, BLK_N, layout=TileLayout(S[(128, BLK_N) : (1 @ tid_in_wg, 1)])
+            )
             Tx.wg.copy_async(Dreg_wg[:, :], tmem[:, :BLK_N])
             T.ptx.tcgen05.wait.ld()
             T.cuda.cta_sync()
@@ -146,8 +164,11 @@ def hgemm_v6(M, N, K):
             T.ptx.fence.proxy_async("shared::cta")
             T.cuda.warpgroup_sync(10)
             if tid == 0:
-                Tx.copy_async(D[m_st : m_st + BLK_M, n_st : n_st + BLK_N],
-                              Dsmem[:, :], dispatch="tma_auto")
+                Tx.copy_async(
+                    D[m_st : m_st + BLK_M, n_st : n_st + BLK_N],
+                    Dsmem[:, :],
+                    dispatch="tma_auto",
+                )
                 T.ptx.cp_async.bulk.commit_group()
                 T.ptx.cp_async.bulk.wait_group(0)
             T.cuda.warpgroup_sync(10)

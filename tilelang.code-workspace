@@ -1,0 +1,14 @@
+{
+  "folders": [
+    {
+      "path": "."
+    }
+  ],
+  "settings": {
+    "python.defaultInterpreterPath": "/home/kael/miniconda3/envs/tilelang/bin/python",
+    "python.analysis.extraPaths": [
+      "/home/kael/dev/src/tilelang",
+      "/home/kael/dev/src/tilelang/3rdparty/tvm/python"
+    ]
+  }
+}
