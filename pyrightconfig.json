@@ -1,0 +1,70 @@
+{
+  "include": [
+    "tilelang-demo",
+    "keneral_demo"
+  ],
+  "exclude": [
+    "**/__pycache__"
+  ],
+  "venvPath": "/home/kael/miniconda3/envs",
+  "venv": "tilelang",
+  "pythonVersion": "3.10",
+  "typeCheckingMode": "basic",
+  "stubPath": "/home/kael/dev/compat/editor-stubs",
+  "reportMissingImports": "error",
+  "reportMissingModuleSource": "warning",
+  "reportOperatorIssue": "none",
+  "reportArgumentType": "none",
+  "reportInvalidTypeForm": "none",
+  "extraPaths": [
+    "/home/kael/dev/src/tilelang",
+    "/home/kael/dev/src/tilelang/3rdparty/tvm/python",
+    "/home/kael/miniconda3/envs/tilelang/lib/python3.10/site-packages"
+  ],
+  "executionEnvironments": [
+    {
+      "root": "/home/kael/dev/compat/editor-stubs/tilelang",
+      "extraPaths": [
+        "/home/kael/dev/src/tilelang",
+        "/home/kael/dev/src/tilelang/3rdparty/tvm/python",
+        "/home/kael/miniconda3/envs/tilelang/lib/python3.10/site-packages"
+      ]
+    },
+    {
+      "root": "/home/kael/dev/compat/editor-stubs/tvm",
+      "extraPaths": [
+        "/home/kael/dev/compat/tvm026/site-packages",
+        "/home/kael/miniconda3/envs/tilelang/lib/python3.10/site-packages"
+      ]
+    },
+    {
+      "root": "/home/kael/dev/compat/tvm026/site-packages",
+      "extraPaths": [
+        "/home/kael/dev/compat/tvm026/site-packages",
+        "/home/kael/miniconda3/envs/tilelang/lib/python3.10/site-packages"
+      ]
+    },
+    {
+      "root": "typings",
+      "extraPaths": [
+        "/home/kael/dev/compat/tvm026/site-packages",
+        "/home/kael/miniconda3/envs/tilelang/lib/python3.10/site-packages"
+      ]
+    },
+    {
+      "root": "keneral_demo",
+      "extraPaths": [
+        "/home/kael/dev/compat/tvm026/site-packages",
+        "/home/kael/miniconda3/envs/tilelang/lib/python3.10/site-packages"
+      ]
+    },
+    {
+      "root": ".",
+      "extraPaths": [
+        "/home/kael/dev/src/tilelang",
+        "/home/kael/dev/src/tilelang/3rdparty/tvm/python",
+        "/home/kael/miniconda3/envs/tilelang/lib/python3.10/site-packages"
+      ]
+    }
+  ]
+}

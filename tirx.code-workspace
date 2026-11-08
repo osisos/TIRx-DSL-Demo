@@ -5,10 +5,6 @@
     }
   ],
   "settings": {
-    "python.defaultInterpreterPath": "/home/kael/miniconda3/envs/tirx/bin/python",
-    "python.analysis.extraPaths": [
-      "/home/kael/dev/src/tvm/3rdparty/tvm-tirx/python",
-      "/home/kael/dev/src/tirx-kernels"
-    ]
+    "python.defaultInterpreterPath": "/home/kael/miniconda3/envs/tirx/bin/python"
   }
 }

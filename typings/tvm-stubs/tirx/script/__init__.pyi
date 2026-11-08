@@ -35,3 +35,31 @@ class SMEMPool(_SMEMPool):
         align=0,
         layout: str | _Layout = "default",
     ) -> _Buffer: ...
+
+# Explicit exports: the runtime builds __all__ dynamically.
+from .builder.ir import Cast as Cast
+from .builder.ir import address_of as address_of
+from .builder.ir import alloc_buffer as alloc_buffer
+from .builder.ir import alloc_local as alloc_local
+from .builder.ir import attr as attr
+from .builder.ir import cta_id as cta_id
+from .builder.ir import decl_buffer as decl_buffer
+from .builder.ir import device_entry as device_entry
+from .builder.ir import evaluate as evaluate
+from .builder.ir import exp as exp
+from .builder.ir import filter as filter
+from .builder.ir import float16 as float16
+from .builder.ir import float32 as float32
+from .builder.ir import func_attr as func_attr
+from .builder.ir import int32 as int32
+from .builder.ir import lane_id as lane_id
+from .builder.ir import let as let
+from .builder.ir import max as max
+from .builder.ir import meta_var as meta_var
+from .builder.ir import tvm_storage_sync as tvm_storage_sync
+from .builder.ir import tvm_warp_shuffle_xor as tvm_warp_shuffle_xor
+from .builder.ir import uint32 as uint32
+from .builder.ir import unroll as unroll
+from .builder.ir import warp_id as warp_id
+from .builder.ir import warp_id_in_wg as warp_id_in_wg
+from .builder.ir import warpgroup_id as warpgroup_id

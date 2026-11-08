@@ -35,9 +35,17 @@ bash ~/dev/scripts/build-tilelang.sh
 ```
 
 此环境的 `tvm` 来自 `~/dev/src/tilelang/3rdparty/tvm/python`。
-它支持基础 `tvm.tirx` 编译，但与本仓库旧版 TVM 0.26 示例的扩展 DSL 不完全兼容：
-例如 `T.device_entry()`、`tvm.tirx.layout`、名为 `tirx` 的 pipeline 不能假定存在。
-这些示例需要按目标版本迁移，不能仅修改导入路径。
+它支持基础 `tvm.tirx` 编译。本仓库旧示例使用更完整的 TVM 0.26 扩展 DSL，
+因此另配了兼容依赖包，放在 `~/dev/compat/tvm026/site-packages`，不创建第三个 Conda/venv 环境。
+运行 `keneral_demo/` 下的脚本或 `-m keneral_demo.*` 时，现有两个 Python 环境会自动选择该兼容配置。
+兼容配置使用独立的 TVM-FFI 0.1.13.post3 和 CUDA 13 运行库，与默认 TileLang 的依赖分进程使用。
+其原有归约示例已通过 GPU 数值验证。交互式运行或从别处导入旧示例时使用：
+
+```bash
+~/dev/scripts/run-tvm026.sh -m keneral_demo.reduce.verify_reduce_1000x1000 --run-cuda
+# 进入旧版 TVM / TIRx 的交互式 Python
+~/dev/scripts/run-tvm026.sh
+```
 
 ## 独立最新版 TIRx
 
@@ -80,3 +88,14 @@ bash ~/dev/scripts/verify.sh
 依赖清单在 `~/dev/envs/*-requirements.lock.txt` 和 `*-conda-explicit.txt`。
 迁移前的环境清单、脚本及本地包备份在 `~/dev/backups/python-envs-20261108/`。
 Conda `base`、系统 Python 和 `sgl-env` 保留。
+
+## 编辑器与类型提示
+
+`pyrightconfig.json` 为 `keneral_demo/` 和 TileLang 代码分别设置对应的源码与 Torch 路径。
+`typings/` 保存动态 DSL 接口的类型声明；`~/dev/scripts/configure-editor-stubs.py`
+将这些声明叠加在匹配的源码树上，生成 `~/dev/compat/editor-stubs/`，供 Pylance 使用。
+没有全局关闭缺失导入或属性错误检查。
+
+VS Code 的 F5 配置分别提供 TileLang、旧 TVM 0.26 和最新独立 TIRx 的运行入口。
+修改配置后可执行 `Developer: Reload Window` 清除以前的解释器缓存。
+草稿的空循环体、未完成表达式仍会正常报语法错误。

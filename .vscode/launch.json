@@ -1,0 +1,44 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "TileLang：当前文件",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "/home/kael/miniconda3/envs/tilelang/bin/python",
+      "env": {
+        "GPU_DEV_PROFILE": "tilelang"
+      },
+      "justMyCode": false
+    },
+    {
+      "name": "TVM 0.26：旧 TIRx 示例",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "/home/kael/miniconda3/envs/tirx/bin/python",
+      "env": {
+        "GPU_DEV_PROFILE": "tvm026"
+      },
+      "justMyCode": false
+    },
+    {
+      "name": "最新独立 TIRx：当前文件",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "/home/kael/miniconda3/envs/tirx/bin/python",
+      "env": {
+        "GPU_DEV_PROFILE": "tirx"
+      },
+      "justMyCode": false
+    }
+  ]
+}

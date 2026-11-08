@@ -1,6 +1,6 @@
 import tvm
-from tvm.script import tirx as T
-from tvm.script.tirx import tile as Tx
+from tvm.tirx import script as T
+from tvm.tirx.script import tile as Tx
 from tvm.tirx.layout import TileLayout, S, TLane, TCol, tid_in_wg
 from tvm.backend.cuda.tile_primitive.tma_utils import mma_shared_layout, SwizzleMode
 from tvm.backend.cuda.lang.pipeline import TMABar, TCGen05Bar, MBarrier, PipelineState
