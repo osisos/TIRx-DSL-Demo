@@ -1,10 +1,25 @@
 {
   "folders": [
     {
+      "name": "TIRx-DSL-Demo (工作区)",
       "path": "."
+    },
+    {
+      "name": "tilelang-src (编译器源码)",
+      "path": "/home/kael/dev/src/tilelang"
     }
   ],
   "settings": {
-    "python.defaultInterpreterPath": "/home/kael/miniconda3/envs/tilelang/bin/python"
+    "python.defaultInterpreterPath": "/home/kael/miniconda3/envs/tilelang/bin/python",
+    "clangd.path": "/home/kael/.local/share/clangd/clangd_23.1.0/bin/clangd",
+    "clangd.arguments": [
+      "--compile-commands-dir=/home/kael/dev/src/tilelang/build",
+      "--background-index",
+      "--completion-style=detailed",
+      "--header-insertion=never"
+    ],
+    "C_Cpp.intelliSenseEngine": "disabled",
+    "C_Cpp.default.compileCommands": "/home/kael/dev/src/tilelang/build/compile_commands.json",
+    "C_Cpp.default.cppStandard": "c++20"
   }
 }

@@ -1,5 +1,6 @@
 """Explicit CUDA facade exports; runtime __all__ is constructed dynamically."""
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Literal, ParamSpec, TypeVar, overload
+from tvm.tirx import PrimFunc as _PrimFunc
 from tilelang.cuda.language import Add as Add
 from tilelang.cuda.language import And as And
 from tilelang.cuda.language import Any as Any
@@ -514,7 +515,6 @@ from tilelang.cuda.language import pdl_sync as pdl_sync
 from tilelang.cuda.language import pdl_trigger as pdl_trigger
 from tilelang.cuda.language import popcount as popcount
 from tilelang.cuda.language import pow as pow
-from tilelang.cuda.language import prim_func as prim_func
 from tilelang.cuda.language import print as print
 from tilelang.cuda.language import ptr as ptr
 from tilelang.cuda.language import ptx_arrive_barrier as ptx_arrive_barrier
@@ -716,3 +716,16 @@ from tilelang.cuda.language import ws_op as ws_op
 
 # Parallel is an iterable in the DSL, interpreted by the AST parser.
 def Parallel(*extents: Any, **kwargs: Any) -> Iterable[Any]: ...
+
+# The default decorator builds IR immediately; only eager_jit=True returns JITFunc.
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+@overload
+def prim_func(func: Callable[_P, _R], *, eager_jit: Literal[False] = False) -> _PrimFunc: ...
+@overload
+def prim_func(func: None = None, *, eager_jit: Literal[False] = False) -> Callable[[Callable[_P, _R]], _PrimFunc]: ...
+@overload
+def prim_func(func: Callable[_P, _R], *, eager_jit: Literal[True]) -> JITFunc[_P, _R]: ...
+@overload
+def prim_func(func: None = None, *, eager_jit: Literal[True]) -> Callable[[Callable[_P, _R]], JITFunc[_P, _R]]: ...

@@ -1,0 +1,20 @@
+# Generated sources have no entries in the compiler's CMake compilation database.
+If:
+  PathMatch: tilelang-demo/trace_output/.*\.(c|cpp|cu)
+CompileFlags:
+  CompilationDatabase: None
+  Add:
+    - -I/home/kael/dev/src/tilelang/3rdparty/tvm/include
+    - -I/home/kael/dev/src/tilelang/3rdparty/tvm/3rdparty/tvm-ffi/include
+    - -I/home/kael/dev/src/tilelang/3rdparty/tvm/3rdparty/tvm-ffi/3rdparty/dlpack/include
+---
+If:
+  PathMatch: tilelang-demo/trace_output/(.*/)?(device_kernel\.cu|codegen_device\.cpp)
+CompileFlags:
+  Add:
+    - -xcuda
+    - --cuda-path=/usr/local/cuda
+    - --cuda-gpu-arch=sm_89
+    - -std=c++17
+    - -I/home/kael/dev/src/tilelang/src
+    - -I/home/kael/dev/src/tilelang/3rdparty/cutlass/include

@@ -326,8 +326,7 @@ def SM89_GEMM(M, N, K):
                 m_tile_idx: T.let = tile_idx // output_tile_cols
                 n_tile_idx: T.let = tile_idx % output_tile_cols
 
-                c_ptrs = [Creg_thread.ptr_to([
-                    m_tile_idx * 2 +
-                ])]
+                # TODO: 完成 mma_v2 的线程寄存器坐标映射和 MMA 实现。
+                # c_ptrs = [Creg_thread.ptr_to([m_tile_idx * 2 + ...])]
 
     return kernel

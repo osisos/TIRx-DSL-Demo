@@ -15,6 +15,91 @@
       "justMyCode": false
     },
     {
+      "name": "TileLang：全链路 Pass 追踪 (零侵入 TL_LOWER_TRACE + DLOG)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "/home/kael/miniconda3/envs/tilelang/bin/python",
+      "env": {
+        "GPU_DEV_PROFILE": "tilelang",
+        "TL_LOWER_TRACE": "both",
+        "TL_LOWER_TRACE_DIR": "${workspaceFolder}/tmp/lower_trace",
+        "TILELANG_PASS_PROFILE": "1",
+        "TILELANG_PASS_PROFILE_THRESHOLD_MS": "0",
+        "TVM_LOG_DEBUG": "DEFAULT=1"
+      },
+      "justMyCode": false
+    },
+    {
+      "name": "TileLang C++：GDB 直接启动当前脚本 (F5 断点直达 C++ Pass)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "/home/kael/miniconda3/envs/tilelang/bin/python",
+      "args": [
+        "${file}"
+      ],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [
+        {
+          "name": "GPU_DEV_PROFILE",
+          "value": "tilelang"
+        },
+        {
+          "name": "TVM_LOG_DEBUG",
+          "value": "DEFAULT=1"
+        }
+      ],
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "setupCommands": [
+        {
+          "description": "启用 GDB Pretty-Printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        },
+        {
+          "description": "允许在 libtilelang.so 尚未 dlopen 前预设 C++ 断点",
+          "text": "set breakpoint pending on",
+          "ignoreFailures": true
+        },
+        {
+          "description": "加载 TVM/TileLang AST 节点打印命令 (ptvm)",
+          "text": "source ${workspaceFolder}/.vscode/tvm_gdb.py",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "TileLang C++：GDB 挂载到运行中 Python (Attach PID 双栈联调)",
+      "type": "cppdbg",
+      "request": "attach",
+      "program": "/home/kael/miniconda3/envs/tilelang/bin/python",
+      "processId": "${command:pickProcess}",
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "setupCommands": [
+        {
+          "description": "启用 GDB Pretty-Printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        },
+        {
+          "description": "允许在动态库上挂起断点",
+          "text": "set breakpoint pending on",
+          "ignoreFailures": true
+        },
+        {
+          "description": "加载 TVM/TileLang AST 节点打印命令 (ptvm)",
+          "text": "source ${workspaceFolder}/.vscode/tvm_gdb.py",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
       "name": "TVM 0.26：旧 TIRx 示例",
       "type": "debugpy",
       "request": "launch",

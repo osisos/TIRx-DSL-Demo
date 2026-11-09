@@ -1,0 +1,69 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "TileLang: 极速增量编译 (Ninja libtilelang.so)",
+      "type": "shell",
+      "command": "/home/kael/miniconda3/envs/tilelang/bin/python",
+      "args": [
+        "${workspaceFolder}/.vscode/tilelang_build_helper.py",
+        "incremental"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": false
+      },
+      "problemMatcher": "$gcc"
+    },
+    {
+      "label": "TileLang: 切换 C++ Pass 为无优化源码调试模式 (-O0 -g3 + DLOG)",
+      "type": "shell",
+      "command": "/home/kael/miniconda3/envs/tilelang/bin/python",
+      "args": [
+        "${workspaceFolder}/.vscode/tilelang_build_helper.py",
+        "debug-passes"
+      ],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": "$gcc"
+    },
+    {
+      "label": "TileLang: 恢复 C++ Pass 为高速模式 (-O2 RelWithDebInfo)",
+      "type": "shell",
+      "command": "/home/kael/miniconda3/envs/tilelang/bin/python",
+      "args": [
+        "${workspaceFolder}/.vscode/tilelang_build_helper.py",
+        "fast-rel"
+      ],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": "$gcc"
+    },
+    {
+      "label": "TileLang: 完整重跑 CMake + 编译 (build-tilelang.sh)",
+      "type": "shell",
+      "command": "/home/kael/miniconda3/envs/tilelang/bin/python",
+      "args": [
+        "${workspaceFolder}/.vscode/tilelang_build_helper.py",
+        "reconfigure"
+      ],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": "$gcc"
+    }
+  ]
+}
