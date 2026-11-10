@@ -1,0 +1,62 @@
+# from tvm.script import ir as I
+# from tvm.script import tirx as T
+
+@I.ir_module
+class Module:
+    @T.prim_func
+    def main(A_handle: T.handle, B_handle: T.handle, C_handle: T.handle):
+        T.func_attr({"target": T.target({"arch": "sm_89", "host": {"keys": ["cpu"], "kind": "c", "tag": ""}, "keys": ["cuda", "gpu"], "kind": "cuda", "max_num_threads": 1024, "tag": "", "thread_warp_size": 32}), "tl.has_tma": T.bool(False)})
+        A = T.match_buffer(A_handle, (4096, 4096), "float16", strides=(4096, 1))
+        B = T.match_buffer(B_handle, (4096, 4096), "float16", strides=(4096, 1))
+        C = T.match_buffer(C_handle, (4096, 4096), strides=(4096, 1))
+        with T.sblock("root"):
+            T.reads()
+            T.writes()
+            C_local = T.Buffer((128,), scope="local")
+            A_shared = T.Buffer((1, 16, 512), "float16", scope="shared.dyn")
+            B_shared = T.Buffer((1, 16, 512), "float16", scope="shared.dyn")
+            T.sblock_attr({"layout_map": {C_local: metadata["tl.Fragment"][0], A_shared: metadata["tl.Layout"][0], B_shared: metadata["tl.Layout"][1]}})
+            bx = T.launch_thread("blockIdx.x", 66)
+            thread_binding = T.launch_thread("threadIdx.x", 128)
+            ty = T.launch_thread("threadIdx.y", 1)
+            tz = T.launch_thread("threadIdx.z", 1)
+            with T.sblock("tilelang_root"):
+                T.reads()
+                T.writes()
+                T.sblock_attr({"layout_map": {C_local: metadata["tl.Fragment"][0], A_shared: metadata["tl.Layout"][0], B_shared: metadata["tl.Layout"][1]}, "tl.launch_threads": [128, 1, 1]})
+                A_shared = T.sblock_alloc_buffer((1, 16, 512), "float16", data=A_shared.data, scope="shared.dyn")
+                B_shared = T.sblock_alloc_buffer((1, 16, 512), "float16", data=B_shared.data, scope="shared.dyn")
+                C_local = T.sblock_alloc_buffer((128,), data=C_local.data, scope="local")
+                for w in range(16):
+                    if w * 66 + bx < 1024:
+                        for i in T.unroll(32):
+                            for vec in T.vectorized(4):
+                                C_local[i * 4 + vec] = T.float32(0.0)
+                    if w * 66 + bx < 1024:
+                        for ko in range(64):
+                            for i in T.unroll(8):
+                                for vec in T.vectorized(8):
+                                    A_shared[0, i * 2 + thread_binding // 64, thread_binding % 64 // 8 * 64 + (thread_binding % 64 // 32 + thread_binding % 8 // 4) % 2 * 32 + (thread_binding % 32 // 16 + thread_binding % 4 // 2) % 2 * 16 + (thread_binding % 16 // 8 + thread_binding % 2) % 2 * 8 + vec] = A[T.Div(T.truncmod(w * 66 + bx, 256), 8) * 128 + i * 16 + thread_binding // 8, ko * 64 + thread_binding % 8 * 8 + vec]
+                            for i in T.unroll(8):
+                                for vec in T.vectorized(8):
+                                    B_shared[0, i * 2 + thread_binding // 64, thread_binding % 64 // 8 * 64 + (thread_binding % 64 // 32 + thread_binding % 8 // 4) % 2 * 32 + (thread_binding % 32 // 16 + thread_binding % 4 // 2) % 2 * 16 + (thread_binding % 16 // 8 + thread_binding % 2) % 2 * 8 + vec] = B[T.Div(w * 66 + bx, 256) * 1024 + T.truncmod(w * 66 + bx, 8) * 128 + i * 16 + thread_binding // 8, ko * 64 + thread_binding % 8 * 8 + vec]
+                            with T.sblock("_gemm_ssr"):
+                                T.reads()
+                                T.writes()
+                                T.sblock_attr({"lexical_alloc_scope": 1})
+                                A_local = T.sblock_alloc_buffer((32,), "float16", scope="local")
+                                B_local = T.sblock_alloc_buffer((32,), "float16", scope="local")
+                                for ki in range(4):
+                                    for i in T.unroll(4):
+                                        T.ptx_ldmatrix(T.bool(False), 4, T.tvm_access_ptr(T.type_annotation("float16"), A_shared.data, thread_binding % 64 // 32 * 4096 + i * 1024 + thread_binding % 16 * 64 + ((ki * 16 + thread_binding % 32 // 16 * 8) // 32 + thread_binding % 8 // 4) % 2 * 32 + (thread_binding % 4 // 2 + ki % 2) % 2 * 16 + (thread_binding % 32 // 16 + thread_binding % 2) % 2 * 8, 8, 1), T.tvm_access_ptr(T.type_annotation("float16"), A_local.data, i * 8, 8, 2))
+                                    for i in T.unroll(4):
+                                        T.ptx_ldmatrix(T.bool(False), 4, T.tvm_access_ptr(T.type_annotation("float16"), B_shared.data, thread_binding // 64 * 4096 + i * 1024 + thread_binding % 32 // 16 * 512 + thread_binding % 8 * 64 + ((ki * 16 + thread_binding % 16 // 8 * 8) // 32 + thread_binding % 8 // 4) % 2 * 32 + (thread_binding % 4 // 2 + ki % 2) % 2 * 16 + (thread_binding % 16 // 8 + thread_binding % 2) % 2 * 8, 8, 1), T.tvm_access_ptr(T.type_annotation("float16"), B_local.data, i * 8, 8, 2))
+                                    for i, j in T.grid(4, 4):
+                                        T.ptx_mma("float32", "m16n8k16", "row", "col", "fp16", "fp16", "fp32", A_local.data, i * 8, B_local.data, j * 8, C_local.data, i * 32 + j * 8, T.bool(False))
+                                        T.ptx_mma("float32", "m16n8k16", "row", "col", "fp16", "fp16", "fp32", A_local.data, i * 8, B_local.data, j * 8 + 4, C_local.data, i * 32 + j * 8 + 4, T.bool(False))
+                    if w * 66 + bx < 1024:
+                        for i in T.unroll(64):
+                            for vec in T.vectorized(2):
+                                C[T.Div(T.truncmod(w * 66 + bx, 256), 8) * 128 + thread_binding % 64 // 32 * 64 + i // 16 * 16 + i % 2 * 8 + thread_binding % 32 // 4, T.Div(w * 66 + bx, 256) * 1024 + T.truncmod(w * 66 + bx, 8) * 128 + thread_binding // 64 * 64 + i % 16 // 2 * 8 + thread_binding % 4 * 2 + vec] = C_local[i * 2 + vec]
+
+# Metadata omitted. Use show_meta=True in script() method to show it.

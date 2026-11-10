@@ -1,0 +1,42 @@
+# from tvm.script import ir as I
+# from tvm.script import tirx as T
+
+@I.ir_module
+class Module:
+    @T.prim_func
+    def _gemm_ssr():
+        # with T.sblock("root"):
+        A_local = T.sblock_alloc_buffer((32,), "float16", scope="local")
+        B_local = T.sblock_alloc_buffer((32,), "float16", scope="local")
+        for ki in range(4):
+            thread_binding = T.int32()
+            tx: T.int32 = thread_binding % 32
+            _: T.int32 = thread_binding // 64 % 2
+            warp_m: T.int32 = thread_binding // 32 % 2
+            for i in T.unroll(4):
+                wi: T.int32 = warp_m * 64 + i * 16
+                wk: T.int32 = ki * 16
+                row_off: T.int32 = tx % 16
+                col_off: T.int32 = 8 * (tx // 16)
+                rel_row: T.int32 = wi + row_off
+                rel_col: T.int32 = wk + col_off
+                lin: T.int32 = (rel_row * 64 + rel_col) % 8192
+                A_shared = T.Buffer((128, 64), "float16", scope="shared.dyn")
+                T.ptx_ldmatrix(T.bool(False), 4, T.access_ptr(A_shared[lin // 64, lin % 64], 8, 1), T.access_ptr(A_local[i * 8], 8, 2))
+            tx_1: T.int32 = thread_binding % 32
+            warp_n: T.int32 = thread_binding // 64 % 2
+            __1: T.int32 = thread_binding // 32 % 2
+            for i in T.unroll(4):
+                wi: T.int32 = warp_n * 64 + i * 16
+                wk: T.int32 = ki * 16
+                row_off: T.int32 = 8 * (tx_1 // 16) + tx_1 % 8
+                col_off: T.int32 = 8 * (tx_1 % 16 // 8)
+                rel_row: T.int32 = wi + row_off
+                rel_col: T.int32 = wk + col_off
+                lin: T.int32 = (rel_row * 64 + rel_col) % 8192
+                B_shared = T.Buffer((128, 64), "float16", scope="shared.dyn")
+                T.ptx_ldmatrix(T.bool(False), 4, T.access_ptr(B_shared[lin // 64, lin % 64], 8, 1), T.access_ptr(B_local[i * 8], 8, 2))
+            for i, j in T.grid(4, 4):
+                C_local = T.handle("float32", "local.fragment")
+                T.ptx_mma("float32", "m16n8k16", "row", "col", "fp16", "fp16", "fp32", A_local.data, i * 8, B_local.data, j * 8, C_local, i * 4 * 8 + j * 8, T.bool(False))
+                T.ptx_mma("float32", "m16n8k16", "row", "col", "fp16", "fp16", "fp32", A_local.data, i * 8, B_local.data, j * 8 + 4, C_local, i * 4 * 8 + j * 8 + 4, T.bool(False))
