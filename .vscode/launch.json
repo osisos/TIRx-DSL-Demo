@@ -10,7 +10,8 @@
       "cwd": "${workspaceFolder}",
       "python": "/home/kael/miniconda3/envs/tilelang/bin/python",
       "env": {
-        "GPU_DEV_PROFILE": "tilelang"
+        "GPU_DEV_PROFILE": "tilelang",
+        "TILELANG_DISABLE_CACHE": "1"
       },
       "justMyCode": false
     },
@@ -24,6 +25,7 @@
       "python": "/home/kael/miniconda3/envs/tilelang/bin/python",
       "env": {
         "GPU_DEV_PROFILE": "tilelang",
+        "TILELANG_DISABLE_CACHE": "1",
         "TL_LOWER_TRACE": "both",
         "TL_LOWER_TRACE_DIR": "${workspaceFolder}/tmp/lower_trace",
         "TILELANG_PASS_PROFILE": "1",
@@ -46,6 +48,10 @@
         {
           "name": "GPU_DEV_PROFILE",
           "value": "tilelang"
+        },
+        {
+          "name": "TILELANG_DISABLE_CACHE",
+          "value": "1"
         },
         {
           "name": "TVM_LOG_DEBUG",
