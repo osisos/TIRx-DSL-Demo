@@ -107,6 +107,181 @@ def issue_gather(
         tl.store(output_ptr + output_index, result)
 
 
+import linecache
+import re
+
+
+def _strip_loc_exprs(line: str) -> str:
+    """移除行内所有的 `loc(...)` 表达式（支持嵌套括号）。"""
+    out = []
+    i = 0
+    n = len(line)
+    while i < n:
+        m = re.search(r"\s*\bloc\(", line[i:])
+        if not m:
+            out.append(line[i:])
+            break
+        out.append(line[i : i + m.start()])
+        paren_start = i + m.end() - 1
+        depth = 0
+        j = paren_start
+        in_str = False
+        while j < n:
+            ch = line[j]
+            if ch == '"' and (j == 0 or line[j - 1] != "\\"):
+                in_str = not in_str
+            elif not in_str:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        j += 1
+                        break
+            j += 1
+        i = j
+    return "".join(out).rstrip()
+
+
+def format_triton_ir(ir_text: str) -> str:
+    """后处理 Triton TTIR/TTGIR：解析 #loc 映射，内联 Python 源码注释，并移除 #loc 噪音。"""
+    lines = ir_text.splitlines()
+
+    # 1. 解析所有 #loc 定义
+    raw_locs: dict[str, tuple] = {}
+    loc_def_re = re.compile(r"^#(loc\w*)\s*=\s*loc\((.+)\)\s*$")
+    file_loc_re = re.compile(r'^"([^"]+)":(\d+):(\d+)$')
+    named_loc_re = re.compile(r'^"[^"]*"\(#(loc\w*)\)$')
+    callsite_re = re.compile(r"^callsite\(#(loc\w*)\s+at\s+#(loc\w*)\)$")
+
+    body_lines: list[str] = []
+    for line in lines:
+        m = loc_def_re.match(line.strip())
+        if m:
+            loc_id, payload = m.group(1), m.group(2).strip()
+            if payload == "unknown":
+                raw_locs[loc_id] = ("unknown",)
+            elif fm := file_loc_re.match(payload):
+                raw_locs[loc_id] = ("file", fm.group(1), int(fm.group(2)))
+            elif nm := named_loc_re.match(payload):
+                raw_locs[loc_id] = ("ref", nm.group(1))
+            elif cm := callsite_re.match(payload):
+                # callsite(callee at caller)：优先展示用户代码中的 caller 位置
+                raw_locs[loc_id] = ("callsite", cm.group(2), cm.group(1))
+            continue
+        body_lines.append(line)
+
+    # 若文件中已经没有 #loc 定义（例如已被格式化过），直接原样返回，保证幂等
+    if not raw_locs:
+        return ir_text
+
+    def resolve_loc(
+        loc_id: str, visited: set[str] | None = None
+    ) -> tuple[str, int] | None:
+        if visited is None:
+            visited = set()
+        if loc_id in visited or loc_id not in raw_locs:
+            return None
+        visited.add(loc_id)
+        entry = raw_locs[loc_id]
+        kind = entry[0]
+        if kind == "file":
+            return (entry[1], entry[2])
+        if kind == "ref":
+            return resolve_loc(entry[1], visited)
+        if kind == "callsite":
+            caller, callee = entry[1], entry[2]
+            return resolve_loc(caller, visited) or resolve_loc(callee, visited)
+        return None
+
+    # 2. 提取每行末尾的 loc(#locXX)，并借助括号栈把块尾 loc 回填到块首（如 scf.for / tt.reduce）
+    trailing_loc_re = re.compile(r"\bloc\(#(loc\w*)\)\s*$")
+    line_locs: list[tuple[str, int] | None] = [None] * len(body_lines)
+    block_stack: list[int] = []
+
+    for idx, line in enumerate(body_lines):
+        stripped = line.strip()
+        m = trailing_loc_re.search(stripped)
+        loc_info = resolve_loc(m.group(1)) if m else None
+        line_locs[idx] = loc_info
+
+        if stripped.startswith("}") and block_stack:
+            open_idx = block_stack.pop()
+            if line_locs[open_idx] is None and loc_info is not None:
+                line_locs[open_idx] = loc_info
+            line_locs[idx] = None
+
+        if stripped.endswith("{"):
+            block_stack.append(idx)
+
+    # 3. 生成清理后的 IR，在源码行变化处插入注释
+    out_lines: list[str] = []
+    last_source_loc: tuple[str, int] | None = None
+
+    for idx, line in enumerate(body_lines):
+        clean_line = _strip_loc_exprs(line)
+        stripped = clean_line.strip()
+        indent = clean_line[: len(clean_line) - len(clean_line.lstrip())]
+
+        # 将超长的 tt.func 签名按参数拆成多行
+        if (
+            stripped.startswith("tt.func ")
+            and "(" in clean_line
+            and ") attributes" in clean_line
+        ):
+            prefix, rest = clean_line.split("(", 1)
+            args_str, suffix = rest.rsplit(") attributes", 1)
+            args = [a.strip() for a in args_str.split(", %")]
+            if len(args) > 1:
+                out_lines.append(f"{prefix}(")
+                for a_idx, arg in enumerate(args):
+                    arg_text = arg if a_idx == 0 else f"%{arg}"
+                    comma = "," if a_idx < len(args) - 1 else ""
+                    out_lines.append(f"{indent}    {arg_text}{comma}")
+                out_lines.append(f"{indent}) attributes{suffix}")
+                last_source_loc = line_locs[idx]
+                continue
+
+        loc_info = line_locs[idx]
+        if (
+            loc_info is not None
+            and loc_info != last_source_loc
+            and not stripped.startswith(("module", "tt.func", "tt.return", "^bb"))
+            and "arith.constant" not in stripped
+        ):
+            filepath, lineno = loc_info
+            src_line = linecache.getline(filepath, lineno).strip()
+            short_file = Path(filepath).name
+            if (
+                out_lines
+                and out_lines[-1].strip() != ""
+                and not out_lines[-1].strip().endswith("{")
+            ):
+                out_lines.append("")
+            if src_line:
+                out_lines.append(f"{indent}// [{short_file}:{lineno}] {src_line}")
+            else:
+                out_lines.append(f"{indent}// [{short_file}:{lineno}]")
+            last_source_loc = loc_info
+
+        out_lines.append(clean_line)
+
+    return "\n".join(out_lines) + "\n"
+
+
+def format_ir_dir(ir_dir: Path) -> None:
+    """批量格式化指定目录下的 .ttir / .ttgir 文件。"""
+    files = sorted(list(ir_dir.rglob("*.ttir")) + list(ir_dir.rglob("*.ttgir")))
+    for path in files:
+        original = path.read_text()
+        formatted = format_triton_ir(original)
+        if formatted != original:
+            path.write_text(formatted)
+            print(f"已格式化: {path}")
+        else:
+            print(f"跳过（已是格式化状态）: {path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kernel", choices=["both", "issue", "gather"], default="both")
@@ -121,7 +296,21 @@ def main():
     parser.add_argument("--num-warps", type=int, choices=[4, 8, 16, 32], default=32)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dump-dir", type=Path, default=Path("tmp/gather-8706"))
+    parser.add_argument(
+        "--raw-ir",
+        action="store_true",
+        help="保存未经去噪后处理的原始 TTIR/TTGIR",
+    )
+    parser.add_argument(
+        "--format-dir",
+        type=Path,
+        default=None,
+        help="仅对指定目录下的 .ttir/.ttgir 文件执行可读性后处理并退出（无需 GPU）",
+    )
     args = parser.parse_args()
+    if args.format_dir is not None:
+        format_ir_dir(args.format_dir)
+        return
     if not torch.cuda.is_available():
         raise RuntimeError("需要 CUDA GPU 和安装了 PyTorch/Triton 的环境。")
 
@@ -169,12 +358,17 @@ def main():
         # 在校验前导出，方便即使数值校验失败也能检查生成代码。
         for stage in ("ttir", "ttgir", "llir", "ptx"):
             if stage in compiled.asm:
-                (args.dump_dir / f"{name}.{stage}").write_text(compiled.asm[stage])
+                text = compiled.asm[stage]
+                if stage in ("ttir", "ttgir") and not args.raw_ir:
+                    text = format_triton_ir(text)
+                (args.dump_dir / f"{name}.{stage}").write_text(text)
         error = (output - reference).abs().max().item()
         # 不同归约顺序在接近零处需要绝对容差。
         torch.testing.assert_close(output, reference, atol=1e-3, rtol=1e-4)
         ms = triton.testing.do_bench(launch)
         ir = compiled.asm.get("ttgir", "")
+        if not args.raw_ir:
+            ir = format_triton_ir(ir)
         conversions = ir.count("ttg.convert_layout")
         print(
             f"{name}: PASS, max_abs_error={error:.6g}, latency={ms:.4f} ms, "

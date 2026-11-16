@@ -1,0 +1,90 @@
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [32, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [32], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 32 : i32, ttg.target = "cuda:89", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @test_gather(
+      %indices_ptr: !tt.ptr<i64> {tt.divisibility = 16 : i32},
+      %table_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+      %output_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32}
+  ) attributes {noinline = false} {
+    %cst = arith.constant dense<4000> : tensor<32xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %cst_0 = arith.constant dense<9000> : tensor<32xi64, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %cst_1 = arith.constant dense<128> : tensor<32x1xi64, #blocked>
+    %cst_2 = arith.constant dense<0> : tensor<32xi64, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %c32_i32 = arith.constant 32 : i32
+    %c0_i32 = arith.constant 0 : i32
+    %c128_i32 = arith.constant 128 : i32
+    %c4000_i32 = arith.constant 4000 : i32
+    %cst_3 = arith.constant dense<0.000000e+00> : tensor<32x128xf32, #blocked>
+
+    // [gather-test.py:30] b = tl.program_id(0)  # 这一行的含义是什么？cta id?
+    %b = tt.get_program_id x : i32
+
+    // [gather-test.py:32] d = tl.arange(0, dim)  # [0..32]
+    %d = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked1>
+
+    // [gather-test.py:34] r_base = tl.arange(0, BLOCK_R)
+    %r_base = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+
+    // [gather-test.py:49] indices_ptr + b * seq_size + r,  # 偏移量？ row = b * seq_size,  col = r
+    %idx = arith.muli %b, %c4000_i32 : i32
+    %idx_4 = tt.addptr %indices_ptr, %idx : !tt.ptr<i64>, i32
+    %idx_5 = tt.splat %idx_4 : !tt.ptr<i64> -> tensor<32x!tt.ptr<i64>, #ttg.slice<{dim = 1, parent = #blocked}>>
+
+    // [gather-test.py:57] table_ptr + idx[:, None] * dim + d[None, :],  # 这个是 parallel？
+    %values = tt.splat %table_ptr : !tt.ptr<f32> -> tensor<32x1x!tt.ptr<f32>, #blocked>
+    %values_6 = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %values_7 = tt.expand_dims %values_6 {axis = 0 : i32} : tensor<128xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x128xi32, #blocked>
+    %values_8 = tt.broadcast %values_7 : tensor<1x128xi32, #blocked> -> tensor<32x128xi32, #blocked>
+
+    // [gather-test.py:42] for start in range(0, seq_size, BLOCK_R):  # 似乎这个一定是时间顺序？
+    %acc = scf.for %acc_9 = %c0_i32 to %c4000_i32 step %c32_i32 iter_args(%arg4 = %cst_3) -> (tensor<32x128xf32, #blocked>)  : i32 {
+      // [gather-test.py:44] r = start + r_base
+      %r = tt.splat %acc_9 : i32 -> tensor<32xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+      %r_10 = arith.addi %r, %r_base : tensor<32xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+
+      // [gather-test.py:45] valid = r < seq_size
+      %valid = arith.cmpi slt, %r_10, %cst : tensor<32xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+
+      // [gather-test.py:49] indices_ptr + b * seq_size + r,  # 偏移量？ row = b * seq_size,  col = r
+      %idx_11 = tt.addptr %idx_5, %r_10 : tensor<32x!tt.ptr<i64>, #ttg.slice<{dim = 1, parent = #blocked}>>, tensor<32xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+      %idx_12 = tt.load %idx_11, %valid, %cst_2 : tensor<32x!tt.ptr<i64>, #ttg.slice<{dim = 1, parent = #blocked}>>
+
+      // [gather-test.py:54] idx = tl.where(idx < 0, idx + vocab_size, idx)  # ? 这是常用的写法吗
+      %idx_13 = arith.cmpi slt, %idx_12, %cst_2 : tensor<32xi64, #ttg.slice<{dim = 1, parent = #blocked}>>
+      %idx_14 = arith.addi %idx_12, %cst_0 : tensor<32xi64, #ttg.slice<{dim = 1, parent = #blocked}>>
+      %idx_15 = arith.select %idx_13, %idx_14, %idx_12 : tensor<32xi1, #ttg.slice<{dim = 1, parent = #blocked}>>, tensor<32xi64, #ttg.slice<{dim = 1, parent = #blocked}>>
+
+      // [gather-test.py:61] mask=valid[:, None],
+      %values_16 = tt.expand_dims %valid {axis = 1 : i32} : tensor<32xi1, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<32x1xi1, #blocked>
+
+      // [gather-test.py:57] table_ptr + idx[:, None] * dim + d[None, :],  # 这个是 parallel？
+      %values_17 = tt.expand_dims %idx_15 {axis = 1 : i32} : tensor<32xi64, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<32x1xi64, #blocked>
+      %values_18 = arith.muli %values_17, %cst_1 : tensor<32x1xi64, #blocked>
+      %values_19 = tt.addptr %values, %values_18 : tensor<32x1x!tt.ptr<f32>, #blocked>, tensor<32x1xi64, #blocked>
+      %values_20 = tt.broadcast %values_19 : tensor<32x1x!tt.ptr<f32>, #blocked> -> tensor<32x128x!tt.ptr<f32>, #blocked>
+      %values_21 = tt.addptr %values_20, %values_8 : tensor<32x128x!tt.ptr<f32>, #blocked>, tensor<32x128xi32, #blocked>
+      %values_22 = tt.broadcast %values_16 : tensor<32x1xi1, #blocked> -> tensor<32x128xi1, #blocked>
+      %values_23 = tt.load %values_21, %values_22, %cst_3 : tensor<32x128x!tt.ptr<f32>, #blocked>
+
+      // [gather-test.py:65] acc += values
+      %acc_24 = arith.addf %arg4, %values_23 : tensor<32x128xf32, #blocked>
+      scf.yield %acc_24 : tensor<32x128xf32, #blocked>
+    }
+
+    // [gather-test.py:67] result = tl.sum(acc, axis=0)
+    %result = "tt.reduce"(%acc) <{axis = 0 : i32}> ({
+    ^bb0(%result_9: f32, %result_10: f32):
+      %result_11 = arith.addf %result_9, %result_10 : f32
+      tt.reduce.return %result_11 : f32
+    }) : (tensor<32x128xf32, #blocked>) -> tensor<128xf32, #ttg.slice<{dim = 0, parent = #blocked}>>
+
+    // [gather-test.py:70] tl.store(output_ptr + b * dim + d, result)
+    %0 = arith.muli %b, %c128_i32 : i32
+    %1 = tt.addptr %output_ptr, %0 : !tt.ptr<f32>, i32
+    %2 = tt.splat %1 : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked1>
+    %3 = tt.addptr %2, %d : tensor<128x!tt.ptr<f32>, #blocked1>, tensor<128xi32, #blocked1>
+    %4 = ttg.convert_layout %result : tensor<128xf32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<128xf32, #blocked1>
+    tt.store %3, %4 : tensor<128x!tt.ptr<f32>, #blocked1>
+    tt.return
+  }
+}

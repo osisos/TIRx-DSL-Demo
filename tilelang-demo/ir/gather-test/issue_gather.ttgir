@@ -1,0 +1,133 @@
+#blocked = #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [2, 16], warpsPerCTA = [32, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [4, 1], threadsPerWarp = [32, 1], warpsPerCTA = [1, 32], order = [0, 1]}>
+#blocked2 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [4, 8], order = [0, 1]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 32 : i32, ttg.target = "cuda:89", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @issue_gather(
+      %indices_ptr: !tt.ptr<i64> {tt.divisibility = 16 : i32},
+      %table_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+      %output_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+      %output_numel: i32 {tt.divisibility = 16 : i32},
+      %seq_size: i32 {tt.divisibility = 16 : i32},
+      %grid_size: i32 {tt.divisibility = 16 : i32}
+  ) attributes {noinline = false} {
+    %cst = arith.constant dense<4000> : tensor<128x1xi32, #blocked>
+    %cst_0 = arith.constant dense<4000> : tensor<1x32xi32, #blocked>
+    %cst_1 = arith.constant dense<4000> : tensor<1x32xi32, #blocked1>
+    %cst_2 = arith.constant dense<128> : tensor<128x1xi32, #blocked>
+    %c128_i32 = arith.constant 128 : i32
+    %c16384_i32 = arith.constant 16384 : i32
+    %c0_i32 = arith.constant 0 : i32
+    %c4000_i32 = arith.constant 4000 : i32
+    %c32_i32 = arith.constant 32 : i32
+    %cst_3 = arith.constant dense<9000> : tensor<128x32xi64, #blocked>
+    %cst_4 = arith.constant dense<0> : tensor<128x32xi64, #blocked>
+    %cst_5 = arith.constant dense<128> : tensor<128x32xi64, #blocked>
+    %cst_6 = arith.constant dense<0.000000e+00> : tensor<128x32xf32, #blocked1>
+
+    // [gather-test.py:87] pid = tl.program_id(0)
+    %pid = tt.get_program_id x : i32
+
+    // [gather-test.py:88] output_start = pid * BLOCK_D
+    %output_start = arith.muli %pid, %c128_i32 : i32
+
+    // [gather-test.py:89] output_stride = grid_size * BLOCK_D
+    %output_stride = arith.muli %grid_size, %c128_i32 : i32
+
+    // [gather-test.py:92] output_index = output_offset + tl.arange(0, BLOCK_D)[:, None]
+    %output_index = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %output_index_7 = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #ttg.slice<{dim = 1, parent = #blocked2}>>
+    %output_index_8 = tt.expand_dims %output_index {axis = 1 : i32} : tensor<128xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<128x1xi32, #blocked>
+    %output_index_9 = tt.expand_dims %output_index_7 {axis = 1 : i32} : tensor<128xi32, #ttg.slice<{dim = 1, parent = #blocked2}>> -> tensor<128x1xi32, #blocked2>
+
+    // [gather-test.py:93] r_base = tl.arange(0, BLOCK_R)[None, :]
+    %r_base = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 0, parent = #blocked1}>>
+    %r_base_10 = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %r_base_11 = tt.expand_dims %r_base {axis = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 0, parent = #blocked1}>> -> tensor<1x32xi32, #blocked1>
+    %r_base_12 = tt.expand_dims %r_base_10 {axis = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x32xi32, #blocked>
+
+    // [gather-test.py:100] idx = tl.load(indices_ptr + r + 4000 * b, valid, other=0.0)
+    %idx = tt.splat %indices_ptr : !tt.ptr<i64> -> tensor<1x32x!tt.ptr<i64>, #blocked>
+
+    // [gather-test.py:103] values = tl.load(table_ptr + d + 128 * idx, valid)
+    %values = tt.splat %table_ptr : !tt.ptr<f32> -> tensor<128x1x!tt.ptr<f32>, #blocked>
+
+    // [gather-test.py:107] tl.store(output_ptr + output_index, result)
+    %0 = tt.splat %output_ptr : !tt.ptr<f32> -> tensor<128x1x!tt.ptr<f32>, #blocked2>
+
+    // [gather-test.py:91] for output_offset in range(output_start, output_numel, output_stride):
+    scf.for %output_offset = %output_start to %c16384_i32 step %output_stride  : i32 {
+      // [gather-test.py:92] output_index = output_offset + tl.arange(0, BLOCK_D)[:, None]
+      %output_index_13 = tt.splat %output_offset : i32 -> tensor<128x1xi32, #blocked>
+      %output_index_14 = tt.splat %output_offset : i32 -> tensor<128x1xi32, #blocked2>
+      %output_index_15 = arith.addi %output_index_13, %output_index_8 : tensor<128x1xi32, #blocked>
+      %output_index_16 = arith.addi %output_index_14, %output_index_9 : tensor<128x1xi32, #blocked2>
+
+      // [gather-test.py:94] b = output_index // 128
+      %b = arith.divsi %output_index_15, %cst_2 : tensor<128x1xi32, #blocked>
+
+      // [gather-test.py:95] d = output_index % 128
+      %d = arith.remsi %output_index_15, %cst_2 : tensor<128x1xi32, #blocked>
+
+      // [gather-test.py:100] idx = tl.load(indices_ptr + r + 4000 * b, valid, other=0.0)
+      %idx_17 = arith.muli %b, %cst : tensor<128x1xi32, #blocked>
+      %idx_18 = tt.broadcast %idx_17 : tensor<128x1xi32, #blocked> -> tensor<128x32xi32, #blocked>
+
+      // [gather-test.py:103] values = tl.load(table_ptr + d + 128 * idx, valid)
+      %values_19 = tt.addptr %values, %d : tensor<128x1x!tt.ptr<f32>, #blocked>, tensor<128x1xi32, #blocked>
+      %values_20 = tt.broadcast %values_19 : tensor<128x1x!tt.ptr<f32>, #blocked> -> tensor<128x32x!tt.ptr<f32>, #blocked>
+
+      // [gather-test.py:97] for start in range(0, seq_size, BLOCK_R):
+      %acc = scf.for %acc_23 = %c0_i32 to %c4000_i32 step %c32_i32 iter_args(%arg8 = %cst_6) -> (tensor<128x32xf32, #blocked1>)  : i32 {
+        // [gather-test.py:98] r = start + r_base
+        %r = tt.splat %acc_23 : i32 -> tensor<1x32xi32, #blocked1>
+        %r_24 = tt.splat %acc_23 : i32 -> tensor<1x32xi32, #blocked>
+        %r_25 = arith.addi %r, %r_base_11 : tensor<1x32xi32, #blocked1>
+        %r_26 = arith.addi %r_24, %r_base_12 : tensor<1x32xi32, #blocked>
+
+        // [gather-test.py:99] valid = r < seq_size
+        %valid = arith.cmpi slt, %r_25, %cst_1 : tensor<1x32xi32, #blocked1>
+        %valid_27 = arith.cmpi slt, %r_26, %cst_0 : tensor<1x32xi32, #blocked>
+
+        // [gather-test.py:100] idx = tl.load(indices_ptr + r + 4000 * b, valid, other=0.0)
+        %idx_28 = tt.addptr %idx, %r_26 : tensor<1x32x!tt.ptr<i64>, #blocked>, tensor<1x32xi32, #blocked>
+        %idx_29 = tt.broadcast %idx_28 : tensor<1x32x!tt.ptr<i64>, #blocked> -> tensor<128x32x!tt.ptr<i64>, #blocked>
+        %idx_30 = tt.addptr %idx_29, %idx_18 : tensor<128x32x!tt.ptr<i64>, #blocked>, tensor<128x32xi32, #blocked>
+        %idx_31 = tt.broadcast %valid : tensor<1x32xi1, #blocked1> -> tensor<128x32xi1, #blocked1>
+        %idx_32 = tt.broadcast %valid_27 : tensor<1x32xi1, #blocked> -> tensor<128x32xi1, #blocked>
+        %idx_33 = tt.load %idx_30, %idx_32, %cst_4 : tensor<128x32x!tt.ptr<i64>, #blocked>
+
+        // [gather-test.py:101] adjusted = idx + tl.full([BLOCK_D, BLOCK_R], 9000, tl.int32)
+        %adjusted = arith.addi %idx_33, %cst_3 : tensor<128x32xi64, #blocked>
+
+        // [gather-test.py:102] idx = tl.where(idx < 0, adjusted, idx)
+        %idx_34 = arith.cmpi slt, %idx_33, %cst_4 : tensor<128x32xi64, #blocked>
+        %idx_35 = arith.select %idx_34, %adjusted, %idx_33 : tensor<128x32xi1, #blocked>, tensor<128x32xi64, #blocked>
+
+        // [gather-test.py:103] values = tl.load(table_ptr + d + 128 * idx, valid)
+        %values_36 = arith.muli %idx_35, %cst_5 : tensor<128x32xi64, #blocked>
+        %values_37 = tt.addptr %values_20, %values_36 : tensor<128x32x!tt.ptr<f32>, #blocked>, tensor<128x32xi64, #blocked>
+        %values_38 = ttg.convert_layout %values_37 : tensor<128x32x!tt.ptr<f32>, #blocked> -> tensor<128x32x!tt.ptr<f32>, #blocked1>
+        %values_39 = tt.load %values_38, %idx_31 : tensor<128x32x!tt.ptr<f32>, #blocked1>
+
+        // [gather-test.py:105] acc = tl.where(valid, acc + values, acc)
+        %acc_40 = arith.addf %arg8, %values_39 : tensor<128x32xf32, #blocked1>
+        %acc_41 = arith.select %idx_31, %acc_40, %arg8 : tensor<128x32xi1, #blocked1>, tensor<128x32xf32, #blocked1>
+        scf.yield %acc_41 : tensor<128x32xf32, #blocked1>
+      }
+
+      // [gather-test.py:106] result = tl.sum(acc, 1)[:, None]
+      %result = "tt.reduce"(%acc) <{axis = 1 : i32}> ({
+      ^bb0(%result_23: f32, %result_24: f32):
+        %result_25 = arith.addf %result_23, %result_24 : f32
+        tt.reduce.return %result_25 : f32
+      }) : (tensor<128x32xf32, #blocked1>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked1}>>
+      %result_21 = ttg.convert_layout %result : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked1}>> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked2}>>
+      %result_22 = tt.expand_dims %result_21 {axis = 1 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked2}>> -> tensor<128x1xf32, #blocked2>
+
+      // [gather-test.py:107] tl.store(output_ptr + output_index, result)
+      %1 = tt.addptr %0, %output_index_16 : tensor<128x1x!tt.ptr<f32>, #blocked2>, tensor<128x1xi32, #blocked2>
+      tt.store %1, %result_22 : tensor<128x1x!tt.ptr<f32>, #blocked2>
+    }
+    tt.return
+  }
+}
