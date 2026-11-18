@@ -99,3 +99,13 @@ Conda `base`、系统 Python 和 `sgl-env` 保留。
 VS Code 的 F5 配置分别提供 TileLang、旧 TVM 0.26 和最新独立 TIRx 的运行入口。
 修改配置后可执行 `Developer: Reload Window` 清除以前的解释器缓存。
 草稿的空循环体、未完成表达式仍会正常报语法错误。
+
+## 编译追踪与 C++ 调试
+
+`tilelang-demo/bug-4056.py`、`tilelang-demo/tilelang_gemm.py` 和 VS Code 的
+Pass 追踪配置统一将运行产物写入 `tmp/lower_trace/`，该目录不提交到 Git。
+`tilelang-demo/trace_output/` 中已提交的报告保留为参考快照。
+
+使用 C++ 调试配置时，`.vscode/tvm_gdb.py` 自动提供 `-exec ptvm <表达式>`
+（打印 IR）、`-exec ptree <表达式>`（展开节点树），以及 Variables / Watch
+中的 IR 展示。辅助脚本依赖本机 TVM-FFI ABI 和 GCC/libstdc++ 的字符串布局。

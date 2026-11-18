@@ -3,3 +3,6 @@ __pycache__/
 *.py[cod]
 .DS_Store
 tmp/
+
+# Keep committed trace snapshots, but exclude new debugging runs.
+tilelang-demo/trace_output/**/.run_records/

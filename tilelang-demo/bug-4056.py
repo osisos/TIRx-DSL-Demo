@@ -52,7 +52,7 @@ def make_kernel():
 if __name__ == "__main__":
     lower_trace.enable(
         mode="both",
-        trace_dir=str(Path(__file__).resolve().parent / "trace_output"),
+        trace_dir=str(Path(__file__).resolve().parents[1] / "tmp" / "lower_trace"),
     )
     with Target({"kind": "cuda", "arch": "sm_89"}) as target:
         tilelang.lower(

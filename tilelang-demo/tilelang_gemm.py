@@ -52,7 +52,7 @@ if __name__ == "__main__":
     from tilelang.transform import PassContext, PassConfigKey
     from tvm.target import Target
 
-    trace_dir = Path(__file__).resolve().parent / "trace_output"
+    trace_dir = Path(__file__).resolve().parents[1] / "tmp" / "lower_trace"
     trace_dir.mkdir(parents=True, exist_ok=True)
 
     # 0. 开启 DEBUG 级别日志 + Lower Trace（捕获所有 Pass 的前后 TIR、终端 Diff、HTML 报告及 Codegen）

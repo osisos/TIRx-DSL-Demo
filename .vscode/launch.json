@@ -2,6 +2,55 @@
   "version": "0.2.0",
   "configurations": [
     {
+      "name": "TileLang C++：4056 布局推导全流程",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "/home/kael/miniconda3/envs/tilelang/bin/python",
+      "args": [
+        "${workspaceFolder}/tilelang-demo/bug-4056.py"
+      ],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [
+        {
+          "name": "GPU_DEV_PROFILE",
+          "value": "tilelang"
+        },
+        {
+          "name": "TILELANG_DISABLE_CACHE",
+          "value": "1"
+        }
+      ],
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "setupCommands": [
+        {
+          "description": "启用 GDB Pretty-Printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        },
+        {
+          "description": "允许在 libtilelang.so 尚未 dlopen 前预设 C++ 断点",
+          "text": "set breakpoint pending on",
+          "ignoreFailures": true
+        },
+        {
+          "description": "加载 TVM/TileLang AST 节点打印命令 (ptvm)",
+          "text": "source ${workspaceFolder}/.vscode/tvm_gdb.py",
+          "ignoreFailures": true
+        },
+        {
+          "text": "set debuginfod enabled off",
+          "ignoreFailures": true
+        },
+        {
+          "text": "set print thread-events off",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
       "name": "TileLang：当前文件",
       "type": "debugpy",
       "request": "launch",
