@@ -15,6 +15,12 @@ import tilelang.language as T
 from tilelang.tools import lower_trace
 from tvm.target import Target
 
+"""
+    Acc = A x B
+    Stat[i] = T.reduce_sum(H, dim = 1)
+    Out = Acc + Stat[i]
+"""
+
 
 def make_kernel():
     @T.prim_func
